@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#0B0D10"/>
+  <!-- prompt chevron -->
+  <polyline points="150,176 230,256 150,336" fill="none" stroke="#E8EAED" stroke-width="44" stroke-linecap="square" stroke-linejoin="miter"/>
+  <!-- cursor block -->
+  <rect x="270" y="300" width="104" height="40" fill="#3DDC97"/>
+</svg>

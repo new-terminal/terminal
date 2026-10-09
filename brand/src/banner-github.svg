@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" width="1280" height="400">
+  <rect width="1280" height="400" fill="#0B0D10"/>
+  <!-- mark: same geometry as svg/new-terminal-avatar-color.svg, scaled -->
+  <g transform="translate(96,72) scale(0.5)">
+    <polyline points="150,176 230,256 150,336" fill="none" stroke="#E8EAED" stroke-width="44" stroke-linecap="square" stroke-linejoin="miter"/>
+    <rect x="270" y="300" width="104" height="40" fill="#3DDC97"/>
+  </g>
+  <text x="330" y="196" font-family="Menlo, 'SF Mono', 'JetBrains Mono', monospace" font-size="72" font-weight="700" fill="#E8EAED">New Terminal</text>
+  <text x="332" y="262" font-family="Menlo, 'SF Mono', 'JetBrains Mono', monospace" font-size="30" fill="#9AA0A6">Every project. Every agent. One terminal.</text>
+</svg>
