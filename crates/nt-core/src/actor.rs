@@ -23,6 +23,7 @@ use crate::agent::{self, AgentHandle, AgentId, PipeEvent};
 use crate::attention::{FinishedTurn, Item, ItemId, Permission, Queue};
 use crate::block::{self, Block};
 use crate::env::{self, Environment};
+use crate::git::{self, Failure};
 use crate::grammar::{
     self, Intent, IntentKind, LINE_LIMIT_KB, LIST_WORDS, NAME_RULE, Name, Parsed,
 };
@@ -62,6 +63,7 @@ const READING_ENVIRONMENT: &str =
     "Reading your shell environment. Send the line again in a moment.";
 /// Names every git call in `app.log`, which adds `git_ms` to its line.
 const GIT_CALL_PREFIX: &str = "git-";
+const HEAD_BRANCH_WORDS: &str = "git rev-parse --abbrev-ref --verify --quiet HEAD";
 const WILL_NOT_CHANGE: &str =
     "New Terminal will not change this file. Fix or move it, then relaunch.";
 
@@ -726,6 +728,8 @@ impl Actor {
                 path.clone().into(),
                 "rev-parse".into(),
                 "--abbrev-ref".into(),
+                "--verify".into(),
+                "--quiet".into(),
                 "HEAD".into(),
             ],
             env: Some(env),
@@ -737,13 +741,13 @@ impl Actor {
 
     fn add_project_done(&mut self, name: Name, path: PathBuf, done: &ChildDone) {
         self.adding.retain(|(adding, _)| *adding != name);
-        let kind = if done.succeeded() && !done.stdout_cut {
-            format!(
-                "git, branch {}",
-                String::from_utf8_lossy(&done.stdout).trim()
-            )
-        } else {
-            "not a git repository".to_owned()
+        let kind = match git::stdout(done, HEAD_BRANCH_WORDS) {
+            Ok(branch) => format!("git, branch {branch}"),
+            Err(Failure::Refused {
+                code: git::NOT_A_COMMIT_CODE,
+                ..
+            }) => "git, no commits yet".to_owned(),
+            Err(_) => "not a git repository".to_owned(),
         };
         let text = format!("Added project {name}: {} ({kind})", path.display());
         if let Err(error) = self.save_registry(self.registry.with_project(Project { name, path })) {

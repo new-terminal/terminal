@@ -13,6 +13,10 @@ use crate::worker::{self, Call, ChildDone};
 
 /// `show-ref --verify --quiet` exits with this code when the ref is absent.
 const REF_ABSENT_CODE: i32 = 1;
+/// `rev-parse --verify --quiet` exits with this code, and prints nothing,
+/// when its argument names no commit, as `HEAD` does in a repository with
+/// no commits yet. Outside a repository git exits with 128.
+pub const NOT_A_COMMIT_CODE: i32 = 1;
 
 /// One repository, as git calls name it, with the environment they run in.
 #[derive(Clone, Debug)]
