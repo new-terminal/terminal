@@ -24,6 +24,9 @@ pub struct Context<'a> {
     /// The app sent an interrupt, so the turn's `result` is expected and
     /// hidden.
     pub interrupted: bool,
+    /// The process already sent an `init`. The CLI sends one per turn, and
+    /// only the first one shows.
+    pub init_seen: bool,
 }
 
 /// One line to show, labeled with the agent's target.
@@ -87,7 +90,7 @@ pub fn map(line: &str, cx: &Context<'_>) -> Mapped {
         );
     };
     match message["type"].as_str() {
-        Some("system") => system(&message),
+        Some("system") => system(&message, cx),
         Some("assistant") => assistant(&message, cx),
         Some("user") => user(&message),
         Some("control_request") => control_request(&message, cx),
@@ -97,11 +100,16 @@ pub fn map(line: &str, cx: &Context<'_>) -> Mapped {
     }
 }
 
-fn system(message: &Value) -> Mapped {
+fn system(message: &Value, cx: &Context<'_>) -> Mapped {
     match message["subtype"].as_str() {
         Some("init") => {
             let cwd = text_field(&message["cwd"]);
-            Mapped::line(LineKind::App, format!("agent started in {cwd}")).with(Effect::Init {
+            let shown = if cx.init_seen {
+                Mapped::default()
+            } else {
+                Mapped::line(LineKind::App, format!("agent started in {cwd}"))
+            };
+            shown.with(Effect::Init {
                 cwd,
                 permission_mode: text_field(&message["permissionMode"]),
                 session_id: text_field(&message["session_id"]),

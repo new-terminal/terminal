@@ -224,6 +224,7 @@ struct Agent {
     log_failed: bool,
     submitted: Instant,
     first_line_seen: bool,
+    init_seen: bool,
     /// Working, or waiting on a permission.
     in_turn: bool,
     waiting: Vec<Waiting>,
@@ -627,6 +628,7 @@ impl Actor {
                 log_failed: false,
                 submitted,
                 first_line_seen: false,
+                init_seen: false,
                 in_turn: false,
                 waiting: Vec::new(),
                 finished_turn: false,
@@ -707,6 +709,7 @@ impl Actor {
                 target: agent.target.as_ref(),
                 path: &agent.path,
                 interrupted: agent.interrupted,
+                init_seen: agent.init_seen,
             },
         );
         for shown in mapped.shown {
@@ -724,7 +727,10 @@ impl Actor {
                 cwd,
                 permission_mode,
                 session_id,
-            } => self.check_init(agent, &cwd, &permission_mode, &session_id),
+            } => {
+                agent.init_seen = true;
+                self.check_init(agent, &cwd, &permission_mode, &session_id);
+            }
             Effect::Working => agent.in_turn |= agent.stop.is_none(),
             Effect::Permission(request) => self.permission(agent, request),
             Effect::TurnDone | Effect::TurnFailed | Effect::InterruptedResult => {

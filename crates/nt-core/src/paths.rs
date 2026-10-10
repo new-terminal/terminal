@@ -66,7 +66,8 @@ pub fn expand_tilde(raw: &str, home_dir: &Path) -> PathBuf {
 }
 
 /// Runs the 7 rules in order and returns the canonical path, or the first
-/// rule the path breaks.
+/// rule the path breaks. Rule 5 tests `path` as given and its canonical
+/// form, so a link cannot hide a guarded part on either side.
 pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
     if !path.is_absolute() {
         return Err(rule(1, "the path must be absolute".to_owned()));
@@ -95,7 +96,7 @@ pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
             ),
         ));
     }
-    if let Some(part) = guarded_part(&canonical) {
+    if let Some(part) = guarded_part(path).or_else(|| guarded_part(&canonical)) {
         return Err(rule(
             5,
             format!(
