@@ -45,8 +45,9 @@ const EXIT_POLL: Duration = Duration::from_millis(100);
 /// without it, so the last output shows before the exit line.
 const EXIT_SHOW_WAIT: Duration = Duration::from_secs(1);
 /// At quit, how long the actor waits for child calls to report once it has
-/// told them to stop.
-const QUIT_CALL_WAIT: Duration = Duration::from_millis(500);
+/// told them to stop. It covers the environment capture's SIGTERM grace, so
+/// its SIGKILL still goes before the process ends.
+const QUIT_CALL_WAIT: Duration = Duration::from_secs(1);
 const STDERR_TAIL_LINES: usize = 20;
 const EXPECTED_PERMISSION_MODE: &str = "default";
 const STOPPED_BY_USER: &str = "Stopped by the user";
@@ -682,6 +683,7 @@ impl Actor {
             ],
             env: Some(env),
             limit: worker::GIT_LIMIT,
+            term_grace: None,
         };
         self.run_call(call, CallPurpose::AddProject { name, path });
     }
@@ -1425,6 +1427,7 @@ impl Actor {
                 argv: vec![path.into(), "--version".into()],
                 env: Some(Arc::clone(&env)),
                 limit: worker::SHORT_LIMIT,
+                term_grace: None,
             };
             self.run_call(call, CallPurpose::ClaudeVersion(path.clone()));
         } else {

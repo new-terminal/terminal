@@ -41,6 +41,9 @@ pub struct Call {
     /// The child's whole environment, or `None` to inherit this process's.
     pub env: Option<Arc<Environment>>,
     pub limit: Duration,
+    /// When set, the time limit and the quit flag send SIGTERM to the
+    /// child's group first, and SIGKILL only this long after it.
+    pub term_grace: Option<Duration>,
 }
 
 /// What a call did. `status` is an error when the program could not start.
@@ -167,14 +170,14 @@ fn execute(call: &Call, quit: &AtomicBool) -> ChildDone {
             Ok(Some(status)) => break (Ok(status), false, false),
             Ok(None) => {}
             Err(error) => {
-                kill_group(&child);
+                signal_group(&child, Signal::SIGKILL);
                 let _ = child.wait();
                 break (Err(error), false, false);
             }
         }
         let quitting = quit.load(Ordering::Relaxed);
         if quitting || Instant::now() >= deadline {
-            kill_group(&child);
+            end_group(&child, call.term_grace);
             break (child.wait(), !quitting, quitting);
         }
         thread::sleep(POLL_INTERVAL);
@@ -206,10 +209,21 @@ fn execute(call: &Call, quit: &AtomicBool) -> ChildDone {
     }
 }
 
-fn kill_group(child: &Child) {
+/// Sends SIGKILL to the child's group, after SIGTERM and `term_grace` when
+/// set. The grace is a sleep, not a reaping wait, so the group id stays the
+/// child's until the SIGKILL goes.
+fn end_group(child: &Child, term_grace: Option<Duration>) {
+    if let Some(grace) = term_grace {
+        signal_group(child, Signal::SIGTERM);
+        thread::sleep(grace);
+    }
+    signal_group(child, Signal::SIGKILL);
+}
+
+fn signal_group(child: &Child, signal: Signal) {
     let id = i32::try_from(child.id()).expect("process ids fit in pid_t");
     // An error means the group is already gone, which is the goal.
-    let _ = killpg(Pid::from_raw(id), Signal::SIGKILL);
+    let _ = killpg(Pid::from_raw(id), signal);
 }
 
 #[derive(Debug, Default)]

@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::worker::{self, Call, ChildDone};
 
@@ -17,6 +18,10 @@ const END_MARKER: &[u8] = b"NT-ENV-END\0";
 /// author's profile prints.
 const SCRIPT: &str = r"printf 'NT-ENV-START\0'; env -0; printf 'NT-ENV-END\0'";
 const ANY_EXECUTE_BIT: u32 = 0o111;
+/// A login shell's rc files can hold a lock file when the capture ends.
+/// SIGTERM lets their exit traps remove it. SIGKILL would leave it behind,
+/// and the next login shells would wait on it.
+const TERM_GRACE: Duration = Duration::from_millis(500);
 const PATH: &str = "PATH";
 const CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
 
@@ -96,6 +101,7 @@ pub fn capture_call() -> Call {
         argv: vec![shell, "-l".into(), "-c".into(), SCRIPT.into()],
         env: None,
         limit: worker::SHORT_LIMIT,
+        term_grace: Some(TERM_GRACE),
     }
 }
 
