@@ -1,0 +1,16 @@
+[package]
+name = "nt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "New Terminal's core: the prompt grammar, the registry, agents, and logs, with no UI dependency"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-channel = { workspace = true }
