@@ -1,0 +1,18 @@
+[package]
+name = "nt-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The New Terminal window: renders nt-core events and sends user actions to it"
+
+[[bin]]
+name = "new-terminal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui-kit = { version = "=0.6.6", default-features = false, features = ["assets"] }
+nt-core = { workspace = true }

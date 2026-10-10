@@ -18,4 +18,5 @@ Install New Terminal from https://github.com/new-terminal/terminal. Follow the r
 - [Design](DESIGN.md): how it works: keys, syntax, and flows
 - [FAQ](FAQ.md): short answers to common questions
 - [Glossary](GLOSSARY.md): the shared language for New Terminal
+- [Building](BUILDING.md): build and run a local copy
 - [License](LICENSE): Apache 2.0
