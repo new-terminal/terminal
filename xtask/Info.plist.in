@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by `cargo xtask bundle`, which fills in @VERSION@.
+     The bundle identifier is what macOS keys privacy grants to, such as
+     folder access: changing it makes every user grant them again. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>new.terminal.NewTerminal</string>
+	<key>CFBundleName</key>
+	<string>New Terminal</string>
+	<key>CFBundleDisplayName</key>
+	<string>New Terminal</string>
+	<key>CFBundleExecutable</key>
+	<string>new-terminal</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Apache License 2.0</string>
+</dict>
+</plist>

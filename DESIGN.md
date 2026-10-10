@@ -84,3 +84,21 @@ An agent that can drive a terminal can do real damage. The rules:
 - **Visible always.** A pane being driven by an agent shows it in the pane header and cursor. Nothing happens in a pane you can't see happening.
 - **You win.** Your requests always take priority. One key stops every agent at once.
 - **Logged.** Every call an agent makes is recorded in the session, so you can replay what it did and why.
+
+## The first version
+
+The first version is the smallest New Terminal I can use to build New Terminal. It keeps the one prompt and leaves most of this document for later. [BUILDING.md](BUILDING.md) says how to build and run it.
+
+- **Mentions lead the line.** A mention counts only at the start of a line, so `@tauri-apps/api` later in a request stays plain text. A line that is only a mention sets the target.
+- **One target per request.** A line with two mentions fails, and the app sends nothing. Send one line per target.
+- **Four lines go to the app, never to an agent.** Names use lowercase letters, digits, and hyphens, up to 32 characters. To send these words to an agent, start the line with a mention.
+  - `add project <name> <path>` adds a project.
+  - `new workspace <name> @<project>` creates a workspace on a git project.
+  - `archive workspace <name>` archives a workspace.
+  - `list` shows every project and workspace.
+- **Reply keys.** When an agent waits on you, the status bar shows `needs you`. `Tab` on an empty prompt brings up the request, with everything it would run. `y` allows it, `n` denies it, and `Esc` puts it back for later.
+- **Questions arrive as text.** An agent asks its question in its reply, with the options. You answer with a line at the prompt, the same as any request. A yes-or-no question takes a typed word, not one key.
+- **Edits inside the target go ahead.** An agent edits files inside its project or workspace without asking. Anything else the agent asks permission for, such as a shell command, waits for your answer.
+- **Setup files always ask.** An edit to a file that the agent's tools load as their own settings asks first, even inside the target. That is any path with a part that starts with `.`, such as `.git` or `.claude`, and files such as `CLAUDE.md` and `AGENTS.md`.
+- **`⌘.` stops every agent.** It ends each agent's process and the commands it started in the background. If an agent ignores the stop, the app kills it and warns that those commands can still run. The next request to that target starts a new agent with no memory of earlier requests. Quitting stops every agent the same way.
+- **Where workspaces live.** A workspace gets an isolated copy of its project at `~/.new-terminal/workspaces/<workspace>/<project>`, on its own branch, `nt/<workspace>`. Archiving removes the copy and keeps the branch. It refuses while the copy has changes that are not committed, or a commit that no branch holds.
