@@ -27,6 +27,20 @@ const CREDENTIAL_DIRECTORIES: [&str; 6] = [".ssh", ".aws", ".azure", ".gnupg", "
 /// runs. A target at `.config` itself would hold it too.
 const CONFIG_DIRECTORY: &str = ".config";
 const GIT_UNDER_CONFIG: &str = "git";
+/// The full Unicode case folds that `to_lowercase` leaves out and that end
+/// in ASCII. APFS applies them when it compares names, so `.ſſh`, `.ßh`, and
+/// `.conﬁg` each open the ASCII directory.
+const ASCII_FOLDS: [(char, &str); 9] = [
+    ('\u{17f}', "s"),
+    ('\u{df}', "ss"),
+    ('\u{fb00}', "ff"),
+    ('\u{fb01}', "fi"),
+    ('\u{fb02}', "fl"),
+    ('\u{fb03}', "ffi"),
+    ('\u{fb04}', "ffl"),
+    ('\u{fb05}', "st"),
+    ('\u{fb06}', "st"),
+];
 
 /// A broken path rule: its number and the text that explains it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,13 +145,27 @@ const fn rule(number: u8, text: String) -> PathRule {
     PathRule { number, text }
 }
 
-/// The first guarded part of `path`, compared without case, as the author
-/// would recognize it.
+/// `name` folded so that two names APFS opens as one file fold to the same
+/// text, as far as a name that folds to ASCII goes. Every rule that compares
+/// a path part with a listed ASCII name compares folded text.
+pub fn fold_case(name: &str) -> String {
+    let mut folded = String::with_capacity(name.len());
+    for c in name.chars().flat_map(char::to_lowercase) {
+        match ASCII_FOLDS.iter().find(|(from, _)| *from == c) {
+            Some((_, to)) => folded.push_str(to),
+            None => folded.push(c),
+        }
+    }
+    folded
+}
+
+/// The first guarded part of `path`, folded, so it reads as the listed
+/// entry it matched.
 fn guarded_part(path: &Path) -> Option<String> {
     let parts: Vec<String> = path
         .components()
         .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().to_lowercase()),
+            Component::Normal(part) => Some(fold_case(&part.to_string_lossy())),
             _ => None,
         })
         .collect();

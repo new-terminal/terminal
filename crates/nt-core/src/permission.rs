@@ -8,9 +8,11 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::paths::fold_case;
+
 /// File names that Claude Code or a tool it guards loads as its own
-/// configuration, in any directory. Compared without case, because macOS
-/// file systems ignore case and the CLI lowercases names for its own check.
+/// configuration, in any directory. Compared through [`fold_case`], because
+/// APFS ignores case and the CLI lowercases names for its own check.
 const SETUP_NAMES: [&str; 9] = [
     "CLAUDE.md",
     "CLAUDE.local.md",
@@ -102,11 +104,4 @@ fn is_setup(below_target: &Path) -> bool {
         SETUP_NAMES.iter().any(|setup| fold_case(setup) == name)
     });
     dot_part || setup_name
-}
-
-/// Lowercase, plus the one fold APFS applies that `to_lowercase` does not:
-/// long s (U+017F) matches `s`, so `pyrightconfig.j\u{17f}on` opens
-/// `pyrightconfig.json`.
-fn fold_case(name: &str) -> String {
-    name.to_lowercase().replace('\u{17f}', "s")
 }
