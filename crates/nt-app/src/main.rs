@@ -49,7 +49,11 @@ fn main() {
             cx.set_global(Core(core.clone()));
             install_quit_routine(cx);
             typeface::install(cx);
-            palette::apply(cx.window_appearance(), cx);
+            if pinned_dark() {
+                palette::apply(gpui_kit::WindowAppearance::Dark, cx);
+            } else {
+                palette::apply(cx.window_appearance(), cx);
+            }
 
             let window = cx
                 .open_window(
@@ -66,7 +70,9 @@ fn main() {
                         ..Default::default()
                     },
                     move |window, cx| {
-                        palette::follow(window);
+                        if !pinned_dark() {
+                            palette::follow(window);
+                        }
                         cx.new(|cx| root::Root::new(core, events, launched, window, cx))
                     },
                 )
@@ -78,6 +84,19 @@ fn main() {
             }
             cx.activate(true);
         });
+}
+
+/// Whether a debug launch asked to review the dark palette whatever the
+/// system appearance, so the window neither reads nor follows it.
+fn pinned_dark() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        demo::dark()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 /// The one quit routine. Every quit path, from the app or from the system,

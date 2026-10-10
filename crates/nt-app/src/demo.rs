@@ -1,19 +1,26 @@
 //! A fixed scene for reviewing the window's look without typing, shown when
-//! a debug build starts with `NT_DEMO=1`. It only fills the view: it sends
-//! nothing to the core and reads or writes no file.
+//! a debug build starts with `NT_DEMO=1`, or with `NT_DEMO=dark` to see it
+//! in the dark palette whatever the system appearance. It only fills the
+//! view: it sends nothing to the core and reads or writes no file.
 
 use nt_core::{Counts, Label, LineKind, Source};
 
 use crate::scrollback::Scrollback;
 
 const SWITCH: &str = "NT_DEMO";
+const DARK: &str = "dark";
 const WORKSPACE: &str = "first-change";
 const PROJECT: &str = "terminal";
 const COMMIT: &str = "git add README.md && git commit -m \"docs: link BUILDING.md\"";
 
 /// Whether this launch asked for the demo scene.
 pub fn wanted() -> bool {
-    std::env::var(SWITCH).is_ok_and(|value| value == "1")
+    std::env::var(SWITCH).is_ok_and(|value| value == "1" || value == DARK)
+}
+
+/// Whether this launch asked for the demo scene in the dark palette.
+pub fn dark() -> bool {
+    std::env::var(SWITCH).is_ok_and(|value| value == DARK)
 }
 
 pub fn label() -> Label {
