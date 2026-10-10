@@ -167,6 +167,15 @@ pub fn turn_line(request: &str) -> String {
     .to_string()
 }
 
+/// Allows the permission request `request_id`. `input` must be the input as
+/// received, so what runs is what the author saw.
+pub fn allow_line(request_id: &str, input: &Value) -> String {
+    control_response(
+        request_id,
+        &json!({"behavior": "allow", "updatedInput": input}),
+    )
+}
+
 /// Denies the permission request `request_id`, telling the agent why.
 pub fn deny_line(request_id: &str, reason: &str) -> String {
     control_response(request_id, &json!({"behavior": "deny", "message": reason}))

@@ -18,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use nix::sys::signal::Signal;
 
 use crate::agent::{self, AgentHandle, AgentId, PipeEvent};
+use crate::attention::{FinishedTurn, Item, ItemId, Permission, Queue};
+use crate::block::{self, Block};
 use crate::env::{self, Environment};
 use crate::grammar::{
     self, Intent, IntentKind, LINE_LIMIT_KB, LIST_WORDS, NAME_RULE, Name, Parsed,
@@ -26,11 +28,12 @@ use crate::home::{self, Home};
 use crate::log::{AgentLog, AppLog, Direction};
 use crate::metrics::{KeypressSamples, KeypressSummary, whole_ms_rounded_up};
 use crate::paths::{self, Rules};
+use crate::permission::{self, Verdict};
 use crate::registry::{NO_PROJECTS, Project, Registry};
 use crate::stop::{SignalSent, Step, StopSteps};
 use crate::stream::{self, Effect, PermissionRequest};
 use crate::worker::{self, Call, ChildDone};
-use crate::{Action, Counts, Event, Label, LineKind, Metric, Source};
+use crate::{Action, Counts, Decision, Event, Label, LineKind, Metric, Reply, Source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How often the actor looks for agent exits while any agent lives.
@@ -44,6 +47,12 @@ const QUIT_CALL_WAIT: Duration = Duration::from_millis(500);
 const STDERR_TAIL_LINES: usize = 20;
 const EXPECTED_PERMISSION_MODE: &str = "default";
 const STOPPED_BY_USER: &str = "Stopped by the user";
+const DECLINED: &str = "Declined at the prompt";
+const ASK_IN_TEXT: &str = "New Terminal takes questions only as text. Ask them in your reply with their options, then end your turn.";
+const TOO_LONG: &str = "Too long to review at the prompt. Make a smaller change.";
+const NO_LONGER_WAITING: &str = "That request is no longer waiting.";
+/// Its answers would need a second reply mode, so the agent asks in text.
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
 const READING_ENVIRONMENT: &str =
     "Reading your shell environment. Send the line again in a moment.";
 
@@ -149,7 +158,8 @@ fn run(
         target: None,
         agents: BTreeMap::new(),
         next_agent: 0,
-        next_item: 0,
+        attention: Queue::default(),
+        replying: None,
         started_targets: BTreeSet::new(),
         failed_targets: BTreeSet::new(),
         stop_all_at: None,
@@ -196,17 +206,6 @@ enum EnvState {
     },
 }
 
-/// An attention item id, unique for the life of the core.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ItemId(u64);
-
-/// A permission request that waits for the author.
-#[derive(Debug)]
-struct Waiting {
-    item: ItemId,
-    request: PermissionRequest,
-}
-
 #[derive(Debug)]
 struct Quitting {
     /// Set once every agent has exited and the quit flag is up.
@@ -227,8 +226,11 @@ struct Agent {
     init_seen: bool,
     /// Working, or waiting on a permission.
     in_turn: bool,
-    waiting: Vec<Waiting>,
-    finished_turn: bool,
+    /// The last text block of the current turn.
+    last_text: String,
+    /// `tool_use_id`s of `AskUserQuestion` requests the app denied. Their
+    /// error results stay in the agent log only.
+    hidden_results: BTreeSet<String>,
     stop: Option<StopSteps>,
     interrupted: bool,
     writer_alive: bool,
@@ -266,7 +268,10 @@ struct Actor {
     target: Option<Name>,
     agents: BTreeMap<AgentId, Agent>,
     next_agent: u64,
-    next_item: u64,
+    attention: Queue,
+    /// The permission that reply mode answers, as last sent in
+    /// [`Event::Prompt`].
+    replying: Option<ItemId>,
     /// Targets that had an agent in this run.
     started_targets: BTreeSet<Name>,
     failed_targets: BTreeSet<Name>,
@@ -293,9 +298,7 @@ impl Actor {
                 ("home", &home),
             ],
         );
-        self.emit(Event::Prompt {
-            label: Label::NoTarget,
-        });
+        self.show_prompt(None);
         self.emit(Event::Status(Counts::default()));
         self.app_line(LineKind::App, NO_PROJECTS.to_owned());
         self.run_call(env::capture_call(), CallPurpose::EnvCapture);
@@ -315,6 +318,13 @@ impl Actor {
         }
         match action {
             Action::Submit { text, at } => self.submit(&text, at),
+            Action::BringUp => {
+                if let Some(item) = self.attention.first() {
+                    self.bring_up(item);
+                }
+            }
+            Action::Answer { item, decision } => self.answer(item, decision),
+            Action::Later(item) => self.later(item),
             Action::StopAll => self.stop_all(),
             Action::Metric(metric) => self.metric(metric),
             Action::Quit => self.quit(),
@@ -329,7 +339,11 @@ impl Actor {
                 return self.add_project(&name, &path);
             }
             Parsed::MentionOnly(name) => {
-                self.mention(name);
+                if self.mention(name.clone())
+                    && let Some(item) = self.attention.for_target(&name)
+                {
+                    self.bring_up(item);
+                }
                 return;
             }
             Parsed::Request { mention, text } => {
@@ -374,12 +388,103 @@ impl Actor {
             );
             return false;
         }
-        self.log("target", &[("name", name.as_ref()), ("saved", "no")]);
-        self.emit(Event::Prompt {
-            label: Label::Project(name.to_string()),
-        });
-        self.target = Some(name);
+        self.set_target(name);
         true
+    }
+
+    fn set_target(&mut self, name: Name) {
+        self.log("target", &[("name", name.as_ref()), ("saved", "no")]);
+        self.target = Some(name);
+        self.show_prompt(None);
+    }
+
+    /// Sends the prompt label for the target, in reply mode for `reply`.
+    /// Reply mode shows the item's target, and the target itself never
+    /// changes for it, so ending reply mode restores the target as it stood
+    /// when the bring-up started.
+    fn show_prompt(&mut self, reply: Option<(Name, Reply)>) {
+        self.replying = reply.as_ref().map(|(_, reply)| reply.item);
+        let (label, reply) = match reply {
+            Some((target, reply)) => (Label::Project(target.to_string()), Some(reply)),
+            None => (
+                self.target
+                    .as_ref()
+                    .map_or(Label::NoTarget, |name| Label::Project(name.to_string())),
+                None,
+            ),
+        };
+        self.emit(Event::Prompt { label, reply });
+    }
+
+    fn end_reply_mode(&mut self) {
+        if self.replying.is_some() {
+            self.show_prompt(None);
+        }
+    }
+
+    /// Shows a permission's request block and starts reply mode for it, or
+    /// shows a finished turn's last text again and makes its target the
+    /// target.
+    fn bring_up(&mut self, item: ItemId) {
+        if let Some(permission) = self.attention.permission(item) {
+            let target = permission.target.clone();
+            let block = permission.block.clone();
+            let question = permission.request.summary.clone();
+            self.agent_line(&target, LineKind::App, block);
+            return self.show_prompt(Some((target, Reply { item, question })));
+        }
+        if let Some(Item::FinishedTurn(turn)) = self.attention.remove(item) {
+            for line in turn.last_text.lines() {
+                self.agent_line(&turn.target, LineKind::AgentText, line.to_owned());
+            }
+            if self.target.as_ref() != Some(&turn.target) {
+                self.set_target(turn.target);
+            }
+        }
+    }
+
+    fn answer(&mut self, item: ItemId, decision: Decision) {
+        if self.attention.permission(item).is_none() {
+            return self.no_longer_waiting();
+        }
+        let Some(Item::Permission(permission)) = self.attention.remove(item) else {
+            return self.no_longer_waiting();
+        };
+        let Some(mut agent) = self.agents.remove(&permission.agent) else {
+            return self.no_longer_waiting();
+        };
+        let (line, field) = match decision {
+            Decision::Allow => (
+                agent::allow_line(&permission.request.request_id, &permission.request.input),
+                "user-allow",
+            ),
+            Decision::Deny => (
+                agent::deny_line(&permission.request.request_id, DECLINED),
+                "user-deny",
+            ),
+        };
+        self.send_answer(&mut agent, line);
+        self.log_decision(
+            &agent,
+            &permission.request,
+            field,
+            permission.setup,
+            Some(item),
+        );
+        self.agents.insert(permission.agent, agent);
+        self.end_reply_mode();
+    }
+
+    fn later(&mut self, item: ItemId) {
+        if !self.attention.later(item) {
+            return self.no_longer_waiting();
+        }
+        self.end_reply_mode();
+    }
+
+    fn no_longer_waiting(&mut self) {
+        self.app_line(LineKind::Error, NO_LONGER_WAITING.to_owned());
+        self.end_reply_mode();
     }
 
     fn known_names(&self) -> Vec<String> {
@@ -483,6 +588,13 @@ impl Actor {
                 ),
             );
         };
+        if let Some(item) = self.attention.permission_for(&target) {
+            self.app_line(
+                LineKind::Error,
+                format!("{target} is waiting for your answer."),
+            );
+            return self.bring_up(item);
+        }
         if matches!(self.env, EnvState::Reading) {
             return self.app_line(LineKind::Error, READING_ENVIRONMENT.to_owned());
         }
@@ -519,9 +631,10 @@ impl Actor {
         };
         let line = agent::turn_line(text);
         self.agent_log(&mut agent, Direction::In, &line);
+        self.attention.remove_turn_of(&target);
         if agent.handle.send(line) {
             agent.in_turn = true;
-            agent.finished_turn = false;
+            agent.last_text.clear();
         } else {
             self.write_failed(&mut agent, "its input is closed");
         }
@@ -630,8 +743,8 @@ impl Actor {
                 first_line_seen: false,
                 init_seen: false,
                 in_turn: false,
-                waiting: Vec::new(),
-                finished_turn: false,
+                last_text: String::new(),
+                hidden_results: BTreeSet::new(),
                 stop: None,
                 interrupted: false,
                 writer_alive: true,
@@ -710,6 +823,7 @@ impl Actor {
                 path: &agent.path,
                 interrupted: agent.interrupted,
                 init_seen: agent.init_seen,
+                hidden_results: &agent.hidden_results,
             },
         );
         for shown in mapped.shown {
@@ -731,11 +845,21 @@ impl Actor {
                 agent.init_seen = true;
                 self.check_init(agent, &cwd, &permission_mode, &session_id);
             }
-            Effect::Working => agent.in_turn |= agent.stop.is_none(),
+            Effect::Working { last_text } => {
+                agent.in_turn |= agent.stop.is_none();
+                agent.last_text = last_text;
+            }
             Effect::Permission(request) => self.permission(agent, request),
             Effect::TurnDone | Effect::TurnFailed | Effect::InterruptedResult => {
                 agent.in_turn = false;
-                agent.finished_turn = matches!(effect, Effect::TurnDone) && agent.stop.is_none();
+                if matches!(effect, Effect::TurnDone) && agent.stop.is_none() {
+                    self.attention.remove_turn_of(&agent.target);
+                    self.attention.push_turn(FinishedTurn {
+                        agent: agent.id,
+                        target: agent.target.clone(),
+                        last_text: std::mem::take(&mut agent.last_text),
+                    });
+                }
                 if let Some(step) = agent.stop.as_mut().and_then(|stop| stop.on_result(now)) {
                     self.take_step(agent, step);
                 }
@@ -779,21 +903,71 @@ impl Actor {
         self.begin_stop(agent, Instant::now());
     }
 
-    /// Every request waits for the author, who can end it only with `⌘.`
-    /// for now. A stopping agent gets an immediate deny.
+    /// Answers a `can_use_tool` request at once when a rule decides it.
+    /// Otherwise it becomes an attention item, and the agent waits for the
+    /// author.
     fn permission(&mut self, agent: &mut Agent, request: PermissionRequest) {
         if agent.is_stopping() {
-            return self.deny_stopped(agent, None, &request);
+            return self.deny_stopped(agent, None, &request, false);
         }
-        let item = ItemId(self.next_item);
-        self.next_item += 1;
-        self.agent_line(&agent.target, LineKind::Attention, request.summary.clone());
-        agent.waiting.push(Waiting { item, request });
+        if request.tool == ASK_USER_QUESTION {
+            if let Some(id) = &request.tool_use_id {
+                agent.hidden_results.insert(id.clone());
+            }
+            self.send_answer(agent, agent::deny_line(&request.request_id, ASK_IN_TEXT));
+            return self.log_decision(agent, &request, "ask-deny", false, None);
+        }
+        let setup = match permission::decide(&request.tool, &request.input, &agent.path) {
+            Verdict::AutoAllow => return self.auto_allow(agent, &request),
+            Verdict::AskAuthor { setup } => setup,
+        };
+        match block::build(&request.tool, &request.input) {
+            Block::TooLong { lines, kb } => {
+                self.send_answer(agent, agent::deny_line(&request.request_id, TOO_LONG));
+                self.agent_line(
+                    &agent.target,
+                    LineKind::Error,
+                    format!(
+                        "{} request denied: too long to review at the prompt ({lines} lines, {kb} KB).",
+                        request.tool
+                    ),
+                );
+                self.log_decision(agent, &request, "too-long-deny", setup, None);
+            }
+            Block::Fits(block) => {
+                self.agent_line(&agent.target, LineKind::Attention, request.summary.clone());
+                self.attention.push_permission(Permission {
+                    agent: agent.id,
+                    target: agent.target.clone(),
+                    request,
+                    block,
+                    setup,
+                });
+            }
+        }
+    }
+
+    fn auto_allow(&mut self, agent: &mut Agent, request: &PermissionRequest) {
+        self.send_answer(
+            agent,
+            agent::allow_line(&request.request_id, &request.input),
+        );
+        let path = request.input["file_path"].as_str().unwrap_or_default();
+        self.agent_line(
+            &agent.target,
+            LineKind::Tool,
+            format!(
+                "{} {} (inside the project, allowed)",
+                request.tool,
+                stream::relative(path, &agent.path)
+            ),
+        );
+        self.log_decision(agent, request, "auto", false, None);
     }
 
     fn deny_waiting(&mut self, agent: &mut Agent) {
-        for waiting in std::mem::take(&mut agent.waiting) {
-            self.deny_stopped(agent, Some(waiting.item), &waiting.request);
+        for (item, waiting) in self.attention.take_permissions_of(agent.id) {
+            self.deny_stopped(agent, Some(item), &waiting.request, waiting.setup);
         }
     }
 
@@ -802,19 +976,38 @@ impl Actor {
         agent: &mut Agent,
         item: Option<ItemId>,
         request: &PermissionRequest,
+        setup: bool,
     ) {
-        let line = agent::deny_line(&request.request_id, STOPPED_BY_USER);
+        self.send_answer(
+            agent,
+            agent::deny_line(&request.request_id, STOPPED_BY_USER),
+        );
+        self.log_decision(agent, request, "stop-deny", setup, item);
+    }
+
+    /// Queues an answer line for the agent's stdin.
+    fn send_answer(&self, agent: &mut Agent, line: String) {
         self.agent_log(agent, Direction::In, &line);
         // A failed send means the writer is gone, and the process is ending.
         let _ = agent.handle.send(line);
-        let item = item.map_or_else(|| "none".to_owned(), |ItemId(id)| id.to_string());
+    }
+
+    fn log_decision(
+        &mut self,
+        agent: &Agent,
+        request: &PermissionRequest,
+        decision: &str,
+        setup: bool,
+        item: Option<ItemId>,
+    ) {
+        let item = item.map_or_else(|| "none".to_owned(), |item| item.to_string());
         self.log(
             "permission",
             &[
                 ("target", agent.target.as_ref()),
                 ("tool", &request.tool),
-                ("decision", "stop-deny"),
-                ("setup", "no"),
+                ("decision", decision),
+                ("setup", if setup { "yes" } else { "no" }),
                 ("item", &item),
                 ("input", &request.input.to_string()),
             ],
@@ -822,6 +1015,7 @@ impl Actor {
     }
 
     fn stop_all(&mut self) {
+        self.end_reply_mode();
         if self.agents.is_empty() {
             return self.app_line(LineKind::Error, "No agents are running.".to_owned());
         }
@@ -975,6 +1169,7 @@ impl Actor {
                 ("by", if by_stop { "stop" } else { "self" }),
             ],
         );
+        self.attention.remove_agent(agent.id);
         if self.agents.is_empty()
             && let Some(started) = self.stop_all_at.take()
         {
@@ -1121,11 +1316,7 @@ impl Actor {
             working: live()
                 .filter(|agent| agent.in_turn && agent.stop.is_none())
                 .count(),
-            needs_you: self
-                .agents
-                .values()
-                .map(|agent| agent.waiting.len() + usize::from(agent.finished_turn))
-                .sum(),
+            needs_you: self.attention.len(),
             failed: self.failed_targets.len(),
             agents_alive: live().count(),
             any_agent_started: !self.started_targets.is_empty(),

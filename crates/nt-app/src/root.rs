@@ -1,14 +1,17 @@
 //! The root view: the scrollback, the prompt, and the status bar, top to
-//! bottom, and the speed metrics.
+//! bottom, and the speed metrics. In reply mode the prompt shows a waiting
+//! permission's question in place of the input and takes only its answer.
 
 use std::time::Instant;
 
 use gpui_kit::base::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, IntoElement,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, IntoElement, Keystroke,
     ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
 };
-use nt_core::{CoreHandle, Counts, Event, Events, Label, LineKind, Metric, Source};
+use nt_core::{
+    CoreHandle, Counts, Decision, Event, Events, Label, LineKind, Metric, Reply, Source,
+};
 
 use crate::palette::Palette;
 use crate::scrollback::Scrollback;
@@ -19,12 +22,15 @@ const FONT: &str = "Menlo";
 const EDGE_PADDING: f32 = 8.;
 const STATUS_SEPARATOR: &str = " │ ";
 const STATUS_KEYS_GAP: &str = "  ";
+const REPLY_HINT: &str = "Answer with y or n, or press Esc.";
 
 pub struct Root {
     core: CoreHandle,
     prompt: Entity<TextareaState>,
     scrollback: Entity<Scrollback>,
     label: Label,
+    /// Set while the prompt is in reply mode.
+    reply: Option<Reply>,
     counts: Counts,
     launched: Instant,
     cold_start_sent: bool,
@@ -62,11 +68,20 @@ impl Root {
                 core.metric(Metric::KeypressToFrame(pressed.elapsed()));
             });
         });
+        let root = cx.entity().downgrade();
+        let on_answer_key = cx.intercept_keystrokes(move |event, window, cx| {
+            let handled = root
+                .update(cx, |root, cx| root.take_key(&event.keystroke, window, cx))
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+            }
+        });
         let scrollback = cx.new(|_| Scrollback::new());
         let pump = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
-                    .update_in(cx, |this, _, cx| this.apply(event, cx))
+                    .update_in(cx, |this, window, cx| this.apply(event, window, cx))
                     .is_err()
                 {
                     break;
@@ -78,10 +93,11 @@ impl Root {
             prompt,
             scrollback,
             label: Label::NoTarget,
+            reply: None,
             counts: Counts::default(),
             launched,
             cold_start_sent: false,
-            _subscriptions: vec![on_enter, on_key],
+            _subscriptions: vec![on_enter, on_key, on_answer_key],
             _pump: pump,
         }
     }
@@ -114,10 +130,58 @@ impl Root {
         cx.notify();
     }
 
-    fn apply(&mut self, event: Event, cx: &mut Context<'_, Self>) {
+    /// Handles the keys that reply mode and `Tab` own, before the input
+    /// sees them. Returns whether the key was taken. `⌘` keys always pass,
+    /// so `⌘.` still stops every agent and `⌘Q` still quits.
+    fn take_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if keystroke.modifiers.platform {
+            return false;
+        }
+        let plain = !keystroke.modifiers.modified();
+        let Some(reply) = &self.reply else {
+            let empty = self.prompt.read(cx).value().is_empty();
+            if keystroke.key == "tab" && plain && empty {
+                self.core.bring_up();
+                return true;
+            }
+            return false;
+        };
+        let item = reply.item;
+        match keystroke.key.as_str() {
+            "y" if plain => self.core.answer(item, Decision::Allow),
+            "n" if plain => self.core.answer(item, Decision::Deny),
+            "escape" if plain => self.core.later(item),
+            _ => {
+                self.push_line(&Source::App, LineKind::App, REPLY_HINT, cx);
+                return true;
+            }
+        }
+        self.leave_reply_mode(window, cx);
+        true
+    }
+
+    /// Shows the input again, with the text it held, and focuses it.
+    fn leave_reply_mode(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.reply = None;
+        self.focus_prompt(window, cx);
+        cx.notify();
+    }
+
+    fn apply(&mut self, event: Event, window: &mut Window, cx: &mut Context<'_, Self>) {
         match event {
             Event::Line { source, kind, text } => self.push_line(&source, kind, &text, cx),
-            Event::Prompt { label } => self.label = label,
+            Event::Prompt { label, reply } => {
+                self.label = label;
+                if reply.is_none() && self.reply.is_some() {
+                    self.leave_reply_mode(window, cx);
+                }
+                self.reply = reply;
+            }
             Event::Status(counts) => self.counts = counts,
             Event::Fatal(text) => self.push_line(&Source::App, LineKind::Error, &text, cx),
         }
@@ -158,8 +222,11 @@ impl Render for Root {
             .text_color(palette.text)
             .font_family(FONT)
             .child(div().flex_1().min_h_0().child(self.scrollback.clone()))
-            .child(
-                div()
+            .child(match &self.reply {
+                Some(reply) => div()
+                    .text_color(palette.accent)
+                    .child(reply_question(&self.label, reply)),
+                None => div()
                     .flex()
                     .gap(px(EDGE_PADDING))
                     .child(
@@ -171,7 +238,7 @@ impl Render for Root {
                             .child(prompt_label(&self.label)),
                     )
                     .child(div().flex_1().child(Textarea::new(&self.prompt))),
-            )
+            })
             .child(
                 div()
                     .text_color(palette.dim)
@@ -185,6 +252,18 @@ fn prompt_label(label: &Label) -> String {
         Label::NoTarget => "no target ›".to_owned(),
         Label::Project(name) => format!("{name} ›"),
     }
+}
+
+/// Reply mode's prompt line, which names the keys that answer.
+fn reply_question(label: &Label, reply: &Reply) -> String {
+    let target = match label {
+        Label::NoTarget => "",
+        Label::Project(name) => name,
+    };
+    format!(
+        "? {target}  {}  [y] yes  [n] no  [esc] later",
+        reply.question
+    )
 }
 
 /// `working` shows once any agent has started, so `0 working` confirms a
@@ -203,10 +282,17 @@ fn status_line(counts: Counts) -> String {
     if counts.failed > 0 {
         parts.push(format!("{} failed", counts.failed));
     }
-    let mut line = parts.join(STATUS_SEPARATOR);
+    let mut keys = Vec::new();
+    if counts.needs_you > 0 {
+        keys.push("⇥ answer");
+    }
     if counts.agents_alive > 0 {
+        keys.push("⌘. stop");
+    }
+    let mut line = parts.join(STATUS_SEPARATOR);
+    if !keys.is_empty() {
         line.push_str(STATUS_KEYS_GAP);
-        line.push_str("⌘. stop");
+        line.push_str(&keys.join(STATUS_KEYS_GAP));
     }
     line
 }

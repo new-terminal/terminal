@@ -5,12 +5,15 @@
 
 mod actor;
 mod agent;
+mod attention;
+mod block;
 mod env;
 mod grammar;
 mod home;
 mod log;
 mod metrics;
 mod paths;
+mod permission;
 mod registry;
 mod stop;
 mod stream;
@@ -22,6 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use actor::Message;
+pub use attention::ItemId;
 
 const DEBUG_HOME: &str = ".new-terminal-dev";
 const RELEASE_HOME: &str = ".new-terminal";
@@ -72,7 +76,25 @@ impl CoreHandle {
         });
     }
 
-    /// Ends every agent process.
+    /// Brings up the first waiting item. A permission starts reply mode
+    /// through [`Event::Prompt`]. A finished turn shows its last text again
+    /// and becomes the target.
+    pub fn bring_up(&self) {
+        self.send(Action::BringUp);
+    }
+
+    /// Answers the permission `item` and ends reply mode. Answers nothing
+    /// when `item` no longer waits, and says so.
+    pub fn answer(&self, item: ItemId, decision: Decision) {
+        self.send(Action::Answer { item, decision });
+    }
+
+    /// Moves `item` to the end of its group and ends reply mode.
+    pub fn later(&self, item: ItemId) {
+        self.send(Action::Later(item));
+    }
+
+    /// Ends every agent process, and ends reply mode.
     pub fn stop_all(&self) {
         self.send(Action::StopAll);
     }
@@ -103,6 +125,13 @@ impl CoreHandle {
         // core ignores actions by contract.
         let _ = self.inbox.send(Message::Action(action));
     }
+}
+
+/// The author's answer to a permission request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny,
 }
 
 /// How [`CoreHandle::wait_closed`] returned.
@@ -142,9 +171,12 @@ pub enum Event {
         kind: LineKind,
         text: String,
     },
-    /// The prompt label to show before the input.
+    /// The prompt label to show before the input. With `reply` set, the
+    /// prompt is in reply mode: it shows the question in place of the input
+    /// and takes only an answer for that item.
     Prompt {
         label: Label,
+        reply: Option<Reply>,
     },
     Status(Counts),
     /// The core stopped and accepts no more actions. The text says why.
@@ -156,6 +188,14 @@ pub enum Event {
 pub enum Source {
     App,
     Target(String),
+}
+
+/// The permission that reply mode answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub item: ItemId,
+    /// `Allow <tool>: <detail> (<n> lines)`.
+    pub question: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +248,12 @@ enum Action {
         text: String,
         at: Instant,
     },
+    BringUp,
+    Answer {
+        item: ItemId,
+        decision: Decision,
+    },
+    Later(ItemId),
     StopAll,
     Quit,
     Metric(Metric),
