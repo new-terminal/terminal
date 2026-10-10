@@ -233,7 +233,7 @@ impl Render for Root {
                         div()
                             .text_color(match self.label {
                                 Label::NoTarget => palette.dim,
-                                Label::Project(_) => palette.text,
+                                Label::Project(_) | Label::Workspace { .. } => palette.text,
                             })
                             .child(prompt_label(&self.label)),
                     )
@@ -251,6 +251,7 @@ fn prompt_label(label: &Label) -> String {
     match label {
         Label::NoTarget => "no target ›".to_owned(),
         Label::Project(name) => format!("{name} ›"),
+        Label::Workspace { name, project } => format!("{name} ({project}) ›"),
     }
 }
 
@@ -258,7 +259,7 @@ fn prompt_label(label: &Label) -> String {
 fn reply_question(label: &Label, reply: &Reply) -> String {
     let target = match label {
         Label::NoTarget => "",
-        Label::Project(name) => name,
+        Label::Project(name) | Label::Workspace { name, .. } => name,
     };
     format!(
         "? {target}  {}  [y] yes  [n] no  [esc] later",

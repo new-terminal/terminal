@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::grammar::{NAME_RULE, Name};
 use crate::home::PRIVATE_FILE_MODE;
 use crate::paths::{self, Rules};
-use crate::registry::{Project, Registry};
+use crate::registry::{Project, Registry, Workspace};
+use crate::workspace;
 
 /// The only format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -26,14 +27,20 @@ pub struct StateFile {
     version: u32,
     target: Option<String>,
     projects: Vec<ProjectEntry>,
+    workspaces: Vec<WorkspaceEntry>,
 }
 
 impl StateFile {
-    pub const fn new(target: Option<String>, projects: Vec<ProjectEntry>) -> Self {
+    pub const fn new(
+        target: Option<String>,
+        projects: Vec<ProjectEntry>,
+        workspaces: Vec<WorkspaceEntry>,
+    ) -> Self {
         Self {
             version: VERSION,
             target,
             projects,
+            workspaces,
         }
     }
 }
@@ -43,6 +50,16 @@ impl StateFile {
 pub struct ProjectEntry {
     pub name: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub project: String,
+    pub branch: String,
+    pub checkout: PathBuf,
+    pub base: String,
 }
 
 /// Read first and on its own, so a file from a newer build reports its
@@ -104,13 +121,17 @@ pub fn read(path: &Path) -> Result<Option<StateFile>, String> {
 /// Checks a parsed file against the name rule and path rules 1 and 3 to 6,
 /// with `look` for the file system facts. Rule 2 gives a warning. Rule 7
 /// waits for the captured environment, so it runs at agent start only.
+/// Each workspace must name a listed project and keep its copy at
+/// `<app_home>/workspaces/<name>/<project>` on branch `nt/<name>`. A missing
+/// copy gives a warning.
 pub fn check(
     file: StateFile,
     home_dir: &Path,
     app_home: &Path,
     look: impl Fn(&Path) -> OnDisk,
 ) -> Result<Loaded, String> {
-    let entries = named_entries(&file.projects)?;
+    let mut names = BTreeSet::new();
+    let entries = named_entries(&file.projects, &mut names)?;
     let mut projects = Vec::with_capacity(entries.len());
     let mut warnings = Vec::new();
     for (index, (name, path)) in entries.iter().enumerate() {
@@ -153,7 +174,15 @@ pub fn check(
             path: path.to_path_buf(),
         });
     }
-    let registry = Registry::from_projects(projects);
+    let workspaces = check_workspaces(
+        &file.workspaces,
+        &mut names,
+        &projects,
+        app_home,
+        &look,
+        &mut warnings,
+    )?;
+    let registry = Registry::from_entries(projects, workspaces);
     let target = match file.target {
         None => None,
         Some(saved) => {
@@ -175,8 +204,10 @@ pub fn check(
 
 /// Each entry's name, checked against the name rule and the other names,
 /// with its path, checked to be absolute.
-fn named_entries(entries: &[ProjectEntry]) -> Result<Vec<(Name, &Path)>, String> {
-    let mut names = BTreeSet::new();
+fn named_entries<'a>(
+    entries: &'a [ProjectEntry],
+    names: &mut BTreeSet<Name>,
+) -> Result<Vec<(Name, &'a Path)>, String> {
     let mut named = Vec::with_capacity(entries.len());
     for entry in entries {
         let Some(name) = Name::parse(&entry.name) else {
@@ -197,6 +228,83 @@ fn named_entries(entries: &[ProjectEntry]) -> Result<Vec<(Name, &Path)>, String>
         named.push((name, entry.path.as_path()));
     }
     Ok(named)
+}
+
+fn check_workspaces(
+    entries: &[WorkspaceEntry],
+    names: &mut BTreeSet<Name>,
+    projects: &[Project],
+    app_home: &Path,
+    look: &impl Fn(&Path) -> OnDisk,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Workspace>, String> {
+    let mut workspaces = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(name) = Name::parse(&entry.name) else {
+            return Err(format!(
+                "workspace {:?} breaks the name rule: {NAME_RULE}",
+                entry.name
+            ));
+        };
+        if !names.insert(name.clone()) {
+            return Err(format!("the name {name} is used by more than one entry"));
+        }
+        let Some(project) = Name::parse(&entry.project)
+            .filter(|project| projects.iter().any(|listed| &listed.name == project))
+        else {
+            return Err(format!(
+                "workspace {name}: its project, {:?}, is not a listed project",
+                entry.project
+            ));
+        };
+        let branch = workspace::branch_name(&name);
+        if entry.branch != branch {
+            return Err(format!(
+                "workspace {name}: its branch, {:?}, must be {branch}",
+                entry.branch
+            ));
+        }
+        let checkout = &entry.checkout;
+        if !checkout.is_absolute() {
+            return Err(format!(
+                "workspace {name}: its checkout, {}, is not absolute",
+                checkout.display()
+            ));
+        }
+        let expected = app_home
+            .join("workspaces")
+            .join(name.as_ref())
+            .join(project.as_ref());
+        if *checkout != expected {
+            return Err(format!(
+                "workspace {name}: its checkout, {}, must be {}",
+                checkout.display(),
+                expected.display()
+            ));
+        }
+        match look(checkout) {
+            OnDisk::Present { canonical, .. } if canonical != *checkout => {
+                return Err(format!(
+                    "workspace {name}: its checkout, {}, resolves to {}",
+                    checkout.display(),
+                    canonical.display()
+                ));
+            }
+            OnDisk::Present { .. } => {}
+            OnDisk::Missing => warnings.push(format!(
+                "Workspace {name}: its isolated copy {} is missing.",
+                checkout.display()
+            )),
+        }
+        workspaces.push(Workspace {
+            name,
+            project,
+            branch,
+            checkout: checkout.clone(),
+            base: entry.base.clone(),
+        });
+    }
+    Ok(workspaces)
 }
 
 /// Writes `file` to `temp` with mode 0600, flushes it to disk, and renames

@@ -1,6 +1,7 @@
-//! The path rules for a project path. An agent edits inside its target with
-//! no question, so these rules keep a target away from the author's home,
-//! git and Claude Code setup, credentials, and New Terminal's own home.
+//! The path rules for a project path, and the check on a workspace's
+//! isolated copy. An agent edits inside its target with no question, so
+//! these rules keep a target away from the author's home, git and Claude
+//! Code setup, credentials, and New Terminal's own home.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -105,20 +106,60 @@ pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
             )
         })?;
     check_placement(path, &canonical, rules)?;
-    if let Some(value) = rules.claude_config_dir.filter(|value| !value.is_empty()) {
-        let config_dir = PathBuf::from(value);
-        let config_dir = fs::canonicalize(&config_dir).unwrap_or(config_dir);
-        if canonical.starts_with(&config_dir) || config_dir.starts_with(&canonical) {
-            return Err(rule(
-                7,
-                format!(
-                    "the path must not be, hold, or sit inside CLAUDE_CONFIG_DIR ({})",
-                    value.display()
-                ),
-            ));
-        }
-    }
+    check_claude_config(&canonical, rules.claude_config_dir)?;
     Ok(canonical)
+}
+
+/// Why a workspace's isolated copy cannot take an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyProblem {
+    Missing,
+    /// The copy exists, but its canonical form is this other path.
+    Moved(PathBuf),
+    /// The copy is not at `<home>/workspaces/<name>/<project>`, shown here.
+    NotAt(PathBuf),
+    Rule(PathRule),
+}
+
+/// The check at agent start for a workspace. The copy stands in for path
+/// rules 1 to 6, because the app made it under its own home: it must
+/// exist, be canonical, and be `expected`. Rule 7 still applies, so a
+/// `CLAUDE_CONFIG_DIR` inside a copy cannot take edits with no question.
+pub fn check_copy(
+    copy: &Path,
+    expected: &Path,
+    claude_config_dir: Option<&OsStr>,
+) -> Result<(), CopyProblem> {
+    let canonical = fs::canonicalize(copy).map_err(|_| CopyProblem::Missing)?;
+    if canonical != copy {
+        return Err(CopyProblem::Moved(canonical));
+    }
+    if copy != expected {
+        return Err(CopyProblem::NotAt(expected.to_path_buf()));
+    }
+    check_claude_config(&canonical, claude_config_dir).map_err(CopyProblem::Rule)
+}
+
+/// Rule 7.
+fn check_claude_config(
+    canonical: &Path,
+    claude_config_dir: Option<&OsStr>,
+) -> Result<(), PathRule> {
+    let Some(value) = claude_config_dir.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let config_dir = PathBuf::from(value);
+    let config_dir = fs::canonicalize(&config_dir).unwrap_or(config_dir);
+    if canonical.starts_with(&config_dir) || config_dir.starts_with(canonical) {
+        return Err(rule(
+            7,
+            format!(
+                "the path must not be, hold, or sit inside CLAUDE_CONFIG_DIR ({})",
+                value.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs rules 3 to 6 on a path read from the state file. A stored path is

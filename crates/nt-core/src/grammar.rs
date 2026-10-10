@@ -74,7 +74,11 @@ pub enum Intent {
         name: String,
         path: String,
     },
-    NewWorkspace,
+    /// `project` is lowercase, as a mention, with its `@` removed.
+    NewWorkspace {
+        name: String,
+        project: String,
+    },
     ArchiveWorkspace,
 }
 
@@ -82,7 +86,7 @@ impl Intent {
     pub const fn kind(&self) -> IntentKind {
         match self {
             Self::AddProject { .. } => IntentKind::AddProject,
-            Self::NewWorkspace => IntentKind::NewWorkspace,
+            Self::NewWorkspace { .. } => IntentKind::NewWorkspace,
             Self::ArchiveWorkspace => IntentKind::ArchiveWorkspace,
         }
     }
@@ -139,10 +143,7 @@ fn parse_intent(line: &str) -> Option<Parsed> {
     let (kind, intent) = if starts_with(IntentKind::AddProject) {
         (IntentKind::AddProject, add_project(arguments))
     } else if starts_with(IntentKind::NewWorkspace) {
-        (
-            IntentKind::NewWorkspace,
-            (word_count == 2).then_some(Intent::NewWorkspace),
-        )
+        (IntentKind::NewWorkspace, new_workspace(arguments))
     } else if starts_with(IntentKind::ArchiveWorkspace) {
         (
             IntentKind::ArchiveWorkspace,
@@ -152,6 +153,19 @@ fn parse_intent(line: &str) -> Option<Parsed> {
         return None;
     };
     Some(intent.map_or(Parsed::IntentUsage(kind), Parsed::Intent))
+}
+
+/// `<name> @<project>`, where the `@` is optional.
+fn new_workspace(arguments: &str) -> Option<Intent> {
+    let mut words = arguments.split_whitespace();
+    let (Some(name), Some(project), None) = (words.next(), words.next(), words.next()) else {
+        return None;
+    };
+    let project = project.strip_prefix('@').unwrap_or(project);
+    Some(Intent::NewWorkspace {
+        name: name.to_owned(),
+        project: project.to_lowercase(),
+    })
 }
 
 /// `<name> <path>`, where the path is the rest of the line, so it may hold

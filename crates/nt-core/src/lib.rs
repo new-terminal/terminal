@@ -8,6 +8,7 @@ mod agent;
 mod attention;
 mod block;
 mod env;
+mod git;
 mod grammar;
 mod home;
 mod log;
@@ -19,6 +20,7 @@ mod state;
 mod stop;
 mod stream;
 mod worker;
+mod workspace;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -223,6 +225,11 @@ pub enum Label {
     NoTarget,
     /// The target is the project with this name.
     Project(String),
+    /// The target is the workspace `name`, an isolated copy of `project`.
+    Workspace {
+        name: String,
+        project: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

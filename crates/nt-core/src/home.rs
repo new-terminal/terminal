@@ -1,5 +1,5 @@
 //! The app home: the directory that holds the logs, the state file and its
-//! lock, and later the isolated copies.
+//! lock, and the isolated copies.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
@@ -36,6 +36,11 @@ impl Home {
 
     pub fn lock_file(&self) -> PathBuf {
         self.root.join("state.lock")
+    }
+
+    /// Holds each workspace's isolated copy at `<name>/<project>`.
+    pub fn workspaces(&self) -> PathBuf {
+        self.root.join("workspaces")
     }
 
     /// Takes the lock on `state.lock`, creating the file if missing. The

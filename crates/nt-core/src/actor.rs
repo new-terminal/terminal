@@ -29,13 +29,14 @@ use crate::grammar::{
 use crate::home::{self, Home, LockError};
 use crate::log::{AgentLog, AppLog, Direction};
 use crate::metrics::{KeypressSamples, KeypressSummary, whole_ms_rounded_up};
-use crate::paths::{self, Rules};
+use crate::paths::{self, CopyProblem, Rules};
 use crate::permission::{self, Verdict};
-use crate::registry::{NO_PROJECTS, Project, Registry};
+use crate::registry::{Entry, NO_PROJECTS, Project, Registry};
 use crate::state::{self, StateFile};
 use crate::stop::{SignalSent, Step, StopSteps};
 use crate::stream::{self, Effect, PermissionRequest};
 use crate::worker::{self, Call, ChildDone};
+use crate::workspace::{self, Create, Next};
 use crate::{Action, Counts, Decision, Event, Label, LineKind, Metric, Reply, Source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -59,6 +60,8 @@ const NO_LONGER_WAITING: &str = "That request is no longer waiting.";
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
 const READING_ENVIRONMENT: &str =
     "Reading your shell environment. Send the line again in a moment.";
+/// Names every git call in `app.log`, which adds `git_ms` to its line.
+const GIT_CALL_PREFIX: &str = "git-";
 const WILL_NOT_CHANGE: &str =
     "New Terminal will not change this file. Fix or move it, then relaunch.";
 
@@ -75,7 +78,12 @@ pub enum Message {
 pub enum CallPurpose {
     EnvCapture,
     ClaudeVersion(PathBuf),
-    AddProject { name: Name, path: PathBuf },
+    AddProject {
+        name: Name,
+        path: PathBuf,
+    },
+    /// A git call of the `new workspace` that holds this name.
+    Create(Name),
 }
 
 /// Runs the actor on its own thread. The thread drops `closed` when it ends,
@@ -163,6 +171,7 @@ fn run(
         refusal: None,
         registry: Registry::default(),
         adding: Vec::new(),
+        creating: BTreeMap::new(),
         target: None,
         saved_target: None,
         agents: BTreeMap::new(),
@@ -226,7 +235,9 @@ struct Quitting {
 struct Agent {
     id: AgentId,
     target: Name,
+    /// The project path, or the workspace's isolated copy.
     path: PathBuf,
+    in_workspace: bool,
     handle: AgentHandle,
     log: Option<AgentLog>,
     log_failed: bool,
@@ -281,6 +292,8 @@ struct Actor {
     /// Projects whose `add project` waits on its git call. Their names and
     /// paths are taken.
     adding: Vec<(Name, PathBuf)>,
+    /// Each `new workspace` in progress. Its name is taken until it ends.
+    creating: BTreeMap<Name, Create>,
     target: Option<Name>,
     /// The target a relaunch would restore from the file as last read or
     /// written.
@@ -369,8 +382,22 @@ impl Actor {
                 return self.app_line(LineKind::Error, WILL_NOT_CHANGE.to_owned());
             }
         }
+        self.warn_leftover_copies();
         if self.registry.project_count() == 0 {
             self.app_line(LineKind::App, NO_PROJECTS.to_owned());
+        }
+    }
+
+    /// A copy that no workspace names is left over from a create that the
+    /// app did not finish, such as one cut off by a quit.
+    fn warn_leftover_copies(&self) {
+        let checkouts = self.registry.checkouts().collect();
+        for copy in workspace::leftover_copies(&self.home.workspaces(), &checkouts) {
+            let copy = self.tilde(&copy);
+            self.app_line(
+                LineKind::Warning,
+                format!("{copy} is left over from an interrupted create."),
+            );
         }
     }
 
@@ -434,6 +461,9 @@ impl Actor {
             Parsed::Intent(Intent::AddProject { name, path }) => {
                 return self.add_project(&name, &path);
             }
+            Parsed::Intent(Intent::NewWorkspace { name, project }) => {
+                return self.new_workspace(&name, &project);
+            }
             Parsed::MentionOnly(name) => {
                 if self.mention(name.clone())
                     && let Some(item) = self.attention.for_target(&name)
@@ -463,7 +493,7 @@ impl Actor {
 
     fn list(&mut self) {
         self.log("intent", &[("kind", LIST_WORDS)]);
-        for line in self.registry.list_lines() {
+        for line in self.registry.list_lines(&self.home_dir) {
             self.app_line(LineKind::App, line);
         }
     }
@@ -471,6 +501,10 @@ impl Actor {
     /// Sets the target when `name` is registered. Otherwise refuses the line
     /// and returns `false`.
     fn mention(&mut self, name: Name) -> bool {
+        if self.creating.contains_key(&name) {
+            self.app_line(LineKind::Error, being_created(&name));
+            return false;
+        }
         if self.registry.find(&name).is_none() {
             let known = self.known_names();
             let known = if known.is_empty() {
@@ -534,15 +568,25 @@ impl Actor {
     fn show_prompt(&mut self, reply: Option<(Name, Reply)>) {
         self.replying = reply.as_ref().map(|(_, reply)| reply.item);
         let (label, reply) = match reply {
-            Some((target, reply)) => (Label::Project(target.to_string()), Some(reply)),
+            Some((target, reply)) => (self.label_for(&target), Some(reply)),
             None => (
                 self.target
                     .as_ref()
-                    .map_or(Label::NoTarget, |name| Label::Project(name.to_string())),
+                    .map_or(Label::NoTarget, |name| self.label_for(name)),
                 None,
             ),
         };
         self.emit(Event::Prompt { label, reply });
+    }
+
+    fn label_for(&self, name: &Name) -> Label {
+        match self.registry.find(name) {
+            Some(Entry::Workspace(workspace)) => Label::Workspace {
+                name: workspace.name.to_string(),
+                project: workspace.project.to_string(),
+            },
+            Some(Entry::Project(_)) | None => Label::Project(name.to_string()),
+        }
     }
 
     fn end_reply_mode(&mut self) {
@@ -645,6 +689,9 @@ impl Actor {
                 format!("{name} is being added. Wait for it to finish."),
             );
         }
+        if self.creating.contains_key(&name) {
+            return self.app_line(LineKind::Error, taken_by_create(&name));
+        }
         let path = paths::expand_tilde(typed_path, &self.home_dir);
         let other_projects = self
             .registry
@@ -699,18 +746,111 @@ impl Actor {
             "not a git repository".to_owned()
         };
         let text = format!("Added project {name}: {} ({kind})", path.display());
-        let registry = self.registry.with_project(Project { name, path });
+        if let Err(error) = self.save_registry(self.registry.with_project(Project { name, path })) {
+            return self.app_line(LineKind::Error, error);
+        }
+        self.app_line(LineKind::App, text);
+    }
+
+    /// Saves `registry` with the live target, and swaps it in only once
+    /// the save succeeds. The error is the line to show.
+    fn save_registry(&mut self, registry: Registry) -> Result<(), String> {
         let file = registry.to_state(self.target.as_ref());
         if let Err(error) = self.save_state(&file) {
             let path = self.tilde(&self.home.state_file());
-            return self.app_line(
-                LineKind::Error,
-                format!("Could not save {path}: {error}. Nothing changed."),
-            );
+            return Err(format!("Could not save {path}: {error}. Nothing changed."));
         }
         self.registry = registry;
         self.saved_target.clone_from(&self.target);
-        self.app_line(LineKind::App, text);
+        Ok(())
+    }
+
+    fn new_workspace(&mut self, typed_name: &str, typed_project: &str) {
+        self.log("intent", &[("kind", "new-workspace"), ("name", typed_name)]);
+        let EnvState::Ready { env, .. } = &self.env else {
+            return self.app_line(LineKind::Error, READING_ENVIRONMENT.to_owned());
+        };
+        let env = Arc::clone(env);
+        let Some(name) = Name::parse(typed_name) else {
+            return self.app_line(
+                LineKind::Error,
+                format!("Cannot create workspace {typed_name}: {NAME_RULE}."),
+            );
+        };
+        let refusal = if let Some(holder) = self.registry.holder(&name) {
+            Some(format!("{name} is taken by {holder}."))
+        } else if self.adding.iter().any(|(adding, _)| *adding == name) {
+            Some(format!(
+                "{name} is taken by project {name}, which is being added."
+            ))
+        } else if self.creating.contains_key(&name) {
+            Some(taken_by_create(&name))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return self.app_line(LineKind::Error, refusal);
+        }
+        let Some(project) = Name::parse(typed_project)
+            .and_then(|project| self.registry.project(&project))
+            .cloned()
+        else {
+            let projects: Vec<String> = self
+                .registry
+                .projects()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            let projects = if projects.is_empty() {
+                "none yet".to_owned()
+            } else {
+                projects.join(", ")
+            };
+            return self.app_line(
+                LineKind::Error,
+                format!("Unknown project @{typed_project}. Projects: {projects}."),
+            );
+        };
+        let (create, next) = Create::start(workspace::Request {
+            name,
+            project: project.name,
+            project_path: project.path,
+            workspaces_dir: self.home.workspaces(),
+            home_dir: self.home_dir.clone(),
+            env,
+        });
+        self.drive_create(create, next);
+    }
+
+    /// Runs a create's next steps until it waits on a git call or ends.
+    /// While it waits, it holds its name in `creating`.
+    fn drive_create(&mut self, mut create: Create, mut next: Next) {
+        loop {
+            next = match next {
+                Next::Run(call) => {
+                    let name = create.name().clone();
+                    self.run_call(call, CallPurpose::Create(name.clone()));
+                    self.creating.insert(name, create);
+                    return;
+                }
+                Next::Save(entry) => {
+                    match self.save_registry(self.registry.with_workspace(entry)) {
+                        Ok(()) => create.saved(),
+                        Err(error) => create.save_failed(error),
+                    }
+                }
+                Next::Done { created, lines } => {
+                    let kind = if created {
+                        LineKind::App
+                    } else {
+                        LineKind::Error
+                    };
+                    for line in lines {
+                        self.app_line(kind, line);
+                    }
+                    return;
+                }
+            };
+        }
     }
 
     fn request(&mut self, text: &str, at: Instant) {
@@ -791,25 +931,16 @@ impl Actor {
             self.app_line(LineKind::Error, claude_missing(&env));
             return None;
         };
-        let project = self.registry.find(target)?.clone();
-        let rules = Rules {
-            home_dir: &self.home_dir,
-            app_home: &self.home.root,
-            claude_config_dir: env.claude_config_dir(),
-            other_projects: self
-                .registry
-                .projects()
-                .filter(|(name, _)| *name != target)
-                .collect(),
-        };
-        let refusal = match paths::check(&project.path, &rules) {
-            Err(rule) => Some(rule.to_string()),
-            Ok(canonical) if canonical != project.path => Some(format!(
-                "{} now resolves to {}",
-                project.path.display(),
-                canonical.display()
-            )),
-            Ok(_) => None,
+        let (path, in_workspace, refusal) = match self.registry.find(target)? {
+            Entry::Project(project) => {
+                let refusal = self.project_refusal(target, &project.path, &env);
+                (project.path.clone(), false, refusal)
+            }
+            Entry::Workspace(workspace) => {
+                let refusal =
+                    self.copy_refusal(target, &workspace.checkout, &workspace.project, &env);
+                (workspace.checkout.clone(), true, refusal)
+            }
         };
         if let Some(refusal) = refusal {
             self.app_line(
@@ -825,7 +956,7 @@ impl Actor {
         let notify = move |event| {
             let _ = inbox.send(Message::Pipe(id, event));
         };
-        let handle = match AgentHandle::spawn(&claude, &project.path, &env, notify) {
+        let handle = match AgentHandle::spawn(&claude, &path, &env, notify) {
             Ok(handle) => handle,
             Err(error) => {
                 self.app_line(
@@ -845,7 +976,7 @@ impl Actor {
             &[
                 ("target", target.as_ref()),
                 ("pid", &pid.to_string()),
-                ("path", &project.path.display().to_string()),
+                ("path", &path.display().to_string()),
             ],
         );
         let log = match AgentLog::open(
@@ -875,7 +1006,8 @@ impl Actor {
             Agent {
                 id,
                 target: target.clone(),
-                path: project.path,
+                path,
+                in_workspace,
                 handle,
                 log,
                 log_failed: false,
@@ -895,6 +1027,60 @@ impl Actor {
             },
         );
         Some(id)
+    }
+
+    /// Why a project's path cannot take an agent now: all 7 path rules, and
+    /// the path must still be canonical.
+    fn project_refusal(&self, target: &Name, path: &Path, env: &Environment) -> Option<String> {
+        let rules = Rules {
+            home_dir: &self.home_dir,
+            app_home: &self.home.root,
+            claude_config_dir: env.claude_config_dir(),
+            other_projects: self
+                .registry
+                .projects()
+                .filter(|(name, _)| *name != target)
+                .collect(),
+        };
+        match paths::check(path, &rules) {
+            Err(rule) => Some(rule.to_string()),
+            Ok(canonical) if canonical != path => Some(format!(
+                "{} now resolves to {}",
+                path.display(),
+                canonical.display()
+            )),
+            Ok(_) => None,
+        }
+    }
+
+    /// Why a workspace's isolated copy cannot take an agent now.
+    fn copy_refusal(
+        &self,
+        target: &Name,
+        copy: &Path,
+        project: &Name,
+        env: &Environment,
+    ) -> Option<String> {
+        let expected = self
+            .home
+            .workspaces()
+            .join(target.as_ref())
+            .join(project.as_ref());
+        let problem = paths::check_copy(copy, &expected, env.claude_config_dir()).err()?;
+        let shown = self.tilde(copy);
+        Some(match problem {
+            CopyProblem::Missing => format!(
+                "its isolated copy {shown} is missing. Send archive workspace {target} to remove the workspace"
+            ),
+            CopyProblem::Moved(canonical) => {
+                format!("{shown} now resolves to {}", canonical.display())
+            }
+            CopyProblem::NotAt(expected) => format!(
+                "its isolated copy {shown} must be {}",
+                self.tilde(&expected)
+            ),
+            CopyProblem::Rule(rule) => rule.to_string(),
+        })
     }
 
     fn pipe(&mut self, id: AgentId, event: PipeEvent) {
@@ -1097,9 +1283,14 @@ impl Actor {
             &agent.target,
             LineKind::Tool,
             format!(
-                "{} {} (inside the project, allowed)",
+                "{} {} (inside the {}, allowed)",
                 request.tool,
-                stream::relative(path, &agent.path)
+                stream::relative(path, &agent.path),
+                if agent.in_workspace {
+                    "workspace"
+                } else {
+                    "project"
+                }
             ),
         );
         self.log_decision(agent, request, "auto", false, None);
@@ -1366,15 +1557,17 @@ impl Actor {
         self.calls_running -= 1;
         let ms = whole_ms_rounded_up(done.elapsed).to_string();
         let exit = done.exit_field();
-        self.log(
-            "child",
-            &[
-                ("call", done.name),
-                ("exit", &exit),
-                ("ms", &ms),
-                ("cut", done.cut_field()),
-            ],
-        );
+        let git_ms = whole_ms_rounded_up(done.ran).to_string();
+        let mut fields = vec![
+            ("call", done.name),
+            ("exit", &exit),
+            ("ms", &ms),
+            ("cut", done.cut_field()),
+        ];
+        if done.name.starts_with(GIT_CALL_PREFIX) {
+            fields.push(("git_ms", &git_ms));
+        }
+        self.log("child", &fields);
         if done.timed_out {
             self.log("timeout", &[("call", done.name)]);
         }
@@ -1395,6 +1588,12 @@ impl Actor {
                 );
             }
             CallPurpose::AddProject { name, path } => self.add_project_done(name, path, done),
+            CallPurpose::Create(name) => {
+                if let Some(mut create) = self.creating.remove(&name) {
+                    let next = create.on_done(done);
+                    self.drive_create(create, next);
+                }
+            }
         }
     }
 
@@ -1453,7 +1652,7 @@ impl Actor {
         let live = || self.agents.values().filter(|agent| agent.exit.is_none());
         Counts {
             projects: self.registry.project_count(),
-            workspaces: 0,
+            workspaces: self.registry.workspace_count(),
             working: live()
                 .filter(|agent| agent.in_turn && agent.stop.is_none())
                 .count(),
@@ -1546,6 +1745,14 @@ impl Actor {
 
 fn claude_missing(env: &Environment) -> String {
     format!("`claude` was not found on PATH ({}).", env.path_text())
+}
+
+fn being_created(name: &Name) -> String {
+    format!("{name} is being created. Wait for it to finish.")
+}
+
+fn taken_by_create(name: &Name) -> String {
+    format!("{name} is taken by workspace {name}, which is being created.")
 }
 
 fn not_built(intent_words: &str) -> String {

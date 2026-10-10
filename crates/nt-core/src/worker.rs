@@ -54,6 +54,8 @@ pub struct ChildDone {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub elapsed: Duration,
+    /// From the start to the child's exit, without the wait for its pipes.
+    pub ran: Duration,
     pub timed_out: bool,
     /// A pipe is cut when its reader dropped bytes or did not reach end of
     /// file in time.
@@ -154,6 +156,7 @@ fn execute(call: &Call, quit: &AtomicBool) -> ChildDone {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 elapsed: started.elapsed(),
+                ran: started.elapsed(),
                 timed_out: false,
                 stdout_cut: false,
                 stderr_cut: false,
@@ -182,6 +185,7 @@ fn execute(call: &Call, quit: &AtomicBool) -> ChildDone {
         }
         thread::sleep(POLL_INTERVAL);
     };
+    let ran = started.elapsed();
 
     let grace = if quitting {
         Duration::ZERO
@@ -203,6 +207,7 @@ fn execute(call: &Call, quit: &AtomicBool) -> ChildDone {
         stdout,
         stderr,
         elapsed: started.elapsed(),
+        ran,
         timed_out,
         stdout_cut,
         stderr_cut,
