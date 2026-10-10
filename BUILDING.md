@@ -60,3 +60,5 @@ Always open the app by that path. Every bundle has the same identifier, so `open
 ## Debug builds
 
 `cargo run -p nt-app` starts a debug build. A debug build keeps its projects, workspaces, and logs in `~/.new-terminal-dev`, so it never changes the installed app's `~/.new-terminal`.
+
+A debug build started with `NT_DEMO=1` shows a fixed scene for reviewing the window's look. It sends nothing to an agent and reads or writes no file. `NT_DEMO=dark` shows the same scene in the dark palette whatever the system appearance.
