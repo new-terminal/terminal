@@ -10,6 +10,8 @@ const DIM_ON_PAPER: u32 = 0x005f_6368;
 const ACCENT: u32 = 0x003d_dc97;
 /// Readable on both backgrounds: contrast 4.46 on ink and 3.62 on paper.
 const ERROR: u32 = 0x00dc_3e42;
+/// Readable on both backgrounds: contrast 4.60 on ink and 3.51 on paper.
+const WARNING: u32 = 0x00a3_7200;
 /// The selection is drawn under the glyphs, so it must let them show.
 const SELECTION_ALPHA: f32 = 0.35;
 
@@ -18,7 +20,9 @@ pub struct Palette {
     pub background: Hsla,
     pub text: Hsla,
     pub dim: Hsla,
+    pub accent: Hsla,
     pub error: Hsla,
+    pub warning: Hsla,
 }
 
 impl Global for Palette {}
@@ -33,7 +37,9 @@ impl Palette {
             background: rgb(background).into(),
             text: rgb(text).into(),
             dim: rgb(dim).into(),
+            accent: rgb(ACCENT).into(),
             error: rgb(ERROR).into(),
+            warning: rgb(WARNING).into(),
         }
     }
 }
@@ -42,7 +48,7 @@ impl Palette {
 /// prompt input, which takes its colors from the base theme.
 pub fn apply(appearance: WindowAppearance, cx: &mut App) {
     let palette = Palette::for_appearance(appearance);
-    let accent: Hsla = rgb(ACCENT).into();
+    let accent = palette.accent;
     let theme = Theme::global_mut(cx);
     theme.appearance = match appearance {
         WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeAppearance::Light,

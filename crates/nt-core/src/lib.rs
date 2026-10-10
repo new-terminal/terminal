@@ -4,15 +4,24 @@
 //! show.
 
 mod actor;
+mod agent;
+mod env;
 mod grammar;
 mod home;
 mod log;
 mod metrics;
+mod paths;
+mod registry;
+mod stop;
+mod stream;
+mod worker;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use actor::Message;
 
 const DEBUG_HOME: &str = ".new-terminal-dev";
 const RELEASE_HOME: &str = ".new-terminal";
@@ -23,10 +32,10 @@ const RELEASE_HOME: &str = ".new-terminal";
 /// missing. When it cannot, the first event is [`Event::Fatal`] and the core
 /// ends.
 pub fn start(app_home: PathBuf) -> (CoreHandle, Events) {
-    let (inbox, actions) = mpsc::channel();
+    let (inbox, messages) = mpsc::channel();
     let (events_tx, events_rx) = async_channel::unbounded();
     let (closed_tx, closed_rx) = mpsc::channel();
-    actor::spawn(app_home, actions, events_tx, closed_tx);
+    actor::spawn(app_home, inbox.clone(), messages, events_tx, closed_tx);
     let handle = CoreHandle {
         inbox,
         closed: Arc::new(Mutex::new(closed_rx)),
@@ -50,14 +59,17 @@ pub fn default_app_home() -> Option<PathBuf> {
 /// core ends a send does nothing.
 #[derive(Clone, Debug)]
 pub struct CoreHandle {
-    inbox: mpsc::Sender<Action>,
+    inbox: mpsc::Sender<Message>,
     closed: Arc<Mutex<mpsc::Receiver<Infallible>>>,
 }
 
 impl CoreHandle {
     /// Sends one line the author typed, exactly as typed.
     pub fn submit(&self, text: String) {
-        self.send(Action::Submit(text));
+        self.send(Action::Submit {
+            text,
+            at: Instant::now(),
+        });
     }
 
     /// Ends every agent process.
@@ -89,7 +101,7 @@ impl CoreHandle {
     fn send(&self, action: Action) {
         // The only failure is a core that has already ended, and an ended
         // core ignores actions by contract.
-        let _ = self.inbox.send(action);
+        let _ = self.inbox.send(Message::Action(action));
     }
 }
 
@@ -150,22 +162,52 @@ pub enum Source {
 pub enum LineKind {
     App,
     Error,
+    /// Text the agent wrote.
+    AgentText,
+    /// A tool the agent called.
+    Tool,
+    Warning,
+    /// A request that waits for the author.
+    Attention,
+    /// A finished turn.
+    Done,
+    /// An agent that the stop steps ended.
+    Stopped,
+    /// An agent that ended on its own.
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Label {
     NoTarget,
+    /// The target is the project with this name.
+    Project(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub projects: usize,
     pub workspaces: usize,
+    /// Agents in a turn, including those that wait on a permission.
+    pub working: usize,
+    /// Waiting permissions plus finished turns.
+    pub needs_you: usize,
+    /// Targets whose last agent ended on its own and that got no request
+    /// since.
+    pub failed: usize,
+    /// Agent processes not yet seen to exit.
+    pub agents_alive: usize,
+    /// Whether any agent has started since launch.
+    pub any_agent_started: bool,
 }
 
 #[derive(Debug)]
 enum Action {
-    Submit(String),
+    /// `at` is when the window took the line, for the speed metrics.
+    Submit {
+        text: String,
+        at: Instant,
+    },
     StopAll,
     Quit,
     Metric(Metric),

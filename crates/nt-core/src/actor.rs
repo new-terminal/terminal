@@ -1,27 +1,74 @@
-//! The actor: one thread that owns all core state and handles one action at
-//! a time.
+//! The actor: one thread that owns all core state and handles one message
+//! at a time. It never waits on a child process or a pipe. Workers and pipe
+//! threads report through its inbox, and the stop-step deadlines and the
+//! exit poll ride on its receive time limit.
 
 use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::grammar::{self, IntentKind, LINE_LIMIT_KB, LIST_WORDS, Name, Parsed};
+use nix::sys::signal::Signal;
+
+use crate::agent::{self, AgentHandle, AgentId, PipeEvent};
+use crate::env::{self, Environment};
+use crate::grammar::{
+    self, Intent, IntentKind, LINE_LIMIT_KB, LIST_WORDS, NAME_RULE, Name, Parsed,
+};
 use crate::home::{self, Home};
-use crate::log::AppLog;
+use crate::log::{AgentLog, AppLog, Direction};
 use crate::metrics::{KeypressSamples, KeypressSummary, whole_ms_rounded_up};
+use crate::paths::{self, Rules};
+use crate::registry::{NO_PROJECTS, Project, Registry};
+use crate::stop::{SignalSent, Step, StopSteps};
+use crate::stream::{self, Effect, PermissionRequest};
+use crate::worker::{self, Call, ChildDone};
 use crate::{Action, Counts, Event, Label, LineKind, Metric, Source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How often the actor looks for agent exits while any agent lives.
+const EXIT_POLL: Duration = Duration::from_millis(100);
+/// An exit shows once the agent's output ends, or this long after the exit
+/// without it, so the last output shows before the exit line.
+const EXIT_SHOW_WAIT: Duration = Duration::from_secs(1);
+/// At quit, how long the actor waits for child calls to report once it has
+/// told them to stop.
+const QUIT_CALL_WAIT: Duration = Duration::from_millis(500);
+const STDERR_TAIL_LINES: usize = 20;
+const EXPECTED_PERMISSION_MODE: &str = "default";
+const STOPPED_BY_USER: &str = "Stopped by the user";
+const READING_ENVIRONMENT: &str =
+    "Reading your shell environment. Send the line again in a moment.";
+
+/// Everything that reaches the actor.
+#[derive(Debug)]
+pub enum Message {
+    Action(Action),
+    Pipe(AgentId, PipeEvent),
+    CallDone(CallPurpose, ChildDone),
+}
+
+/// Why a child call ran, so its result reaches the right handler.
+#[derive(Debug)]
+pub enum CallPurpose {
+    EnvCapture,
+    ClaudeVersion(PathBuf),
+    AddProject { name: Name, path: PathBuf },
+}
 
 /// Runs the actor on its own thread. The thread drops `closed` when it ends,
 /// which is how [`crate::CoreHandle::wait_closed`] sees the end.
 pub fn spawn(
     app_home: PathBuf,
-    actions: mpsc::Receiver<Action>,
+    inbox: mpsc::Sender<Message>,
+    messages: mpsc::Receiver<Message>,
     events: async_channel::Sender<Event>,
     closed: mpsc::Sender<Infallible>,
 ) {
@@ -29,9 +76,10 @@ pub fn spawn(
         .name("nt-core".to_owned())
         .spawn(move || {
             // The events sender stays outside the unwind boundary so a panic
-            // can still tell the window that the core stopped.
+            // can still tell the window that the core stopped. The unwind
+            // drops every agent handle, which sends SIGTERM to its group.
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                run(&app_home, &actions, &events);
+                run(&app_home, inbox, &messages, &events);
             }));
             if let Err(payload) = outcome {
                 let _ = events.try_send(Event::Fatal(format!(
@@ -54,7 +102,12 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
-fn run(app_home: &Path, actions: &mpsc::Receiver<Action>, events: &async_channel::Sender<Event>) {
+fn run(
+    app_home: &Path,
+    inbox: mpsc::Sender<Message>,
+    messages: &mpsc::Receiver<Message>,
+    events: &async_channel::Sender<Event>,
+) {
     let home = match home::prepare(app_home) {
         Ok(home) => home,
         Err(failure) => {
@@ -77,18 +130,54 @@ fn run(app_home: &Path, actions: &mpsc::Receiver<Action>, events: &async_channel
             return;
         }
     };
+    let home_dir = std::env::home_dir()
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+        .unwrap_or_default();
     let mut actor = Actor {
         home,
+        home_dir,
         log,
         log_failed: false,
         events: events.clone(),
+        inbox,
         keypresses: KeypressSamples::default(),
+        quit_flag: Arc::new(AtomicBool::new(false)),
+        calls_running: 0,
+        env: EnvState::Reading,
+        registry: Registry::default(),
+        adding: Vec::new(),
+        target: None,
+        agents: BTreeMap::new(),
+        next_agent: 0,
+        next_item: 0,
+        started_targets: BTreeSet::new(),
+        failed_targets: BTreeSet::new(),
+        stop_all_at: None,
+        quitting: None,
+        sent_counts: Counts::default(),
     };
     actor.launch();
-    for action in actions {
-        if actor.handle(action) == Flow::End {
+    loop {
+        let message = match actor.next_wake() {
+            Some(wake) => {
+                match messages.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                    Ok(message) => Some(message),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            None => match messages.recv() {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvError) => return,
+            },
+        };
+        if let Some(message) = message {
+            actor.handle(message);
+        }
+        if actor.tick(Instant::now()) == Flow::End {
             return;
         }
+        actor.send_counts();
     }
 }
 
@@ -99,12 +188,90 @@ enum Flow {
 }
 
 #[derive(Debug)]
+enum EnvState {
+    Reading,
+    Ready {
+        env: Arc<Environment>,
+        claude: Option<PathBuf>,
+    },
+}
+
+/// An attention item id, unique for the life of the core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemId(u64);
+
+/// A permission request that waits for the author.
+#[derive(Debug)]
+struct Waiting {
+    item: ItemId,
+    request: PermissionRequest,
+}
+
+#[derive(Debug)]
+struct Quitting {
+    /// Set once every agent has exited and the quit flag is up.
+    calls_until: Option<Instant>,
+}
+
+/// One agent process and what the actor knows about it.
+#[derive(Debug)]
+struct Agent {
+    id: AgentId,
+    target: Name,
+    path: PathBuf,
+    handle: AgentHandle,
+    log: Option<AgentLog>,
+    log_failed: bool,
+    submitted: Instant,
+    first_line_seen: bool,
+    /// Working, or waiting on a permission.
+    in_turn: bool,
+    waiting: Vec<Waiting>,
+    finished_turn: bool,
+    stop: Option<StopSteps>,
+    interrupted: bool,
+    writer_alive: bool,
+    stdout_ended: bool,
+    stderr_ended: bool,
+    exit: Option<(ExitStatus, Instant)>,
+    stderr_tail: VecDeque<String>,
+}
+
+impl Agent {
+    const fn is_stopping(&self) -> bool {
+        self.stop.is_some() || self.exit.is_some()
+    }
+}
+
+#[derive(Debug)]
 struct Actor {
     home: Home,
+    /// The user's home directory, canonical.
+    home_dir: PathBuf,
     log: AppLog,
     log_failed: bool,
     events: async_channel::Sender<Event>,
+    inbox: mpsc::Sender<Message>,
     keypresses: KeypressSamples,
+    /// Tells every running child call to stop, once quit has ended the
+    /// agents.
+    quit_flag: Arc<AtomicBool>,
+    calls_running: usize,
+    env: EnvState,
+    registry: Registry,
+    /// Projects whose `add project` waits on its git call. Their names and
+    /// paths are taken.
+    adding: Vec<(Name, PathBuf)>,
+    target: Option<Name>,
+    agents: BTreeMap<AgentId, Agent>,
+    next_agent: u64,
+    next_item: u64,
+    /// Targets that had an agent in this run.
+    started_targets: BTreeSet<Name>,
+    failed_targets: BTreeSet<Name>,
+    stop_all_at: Option<Instant>,
+    quitting: Option<Quitting>,
+    sent_counts: Counts,
 }
 
 impl Actor {
@@ -129,29 +296,803 @@ impl Actor {
             label: Label::NoTarget,
         });
         self.emit(Event::Status(Counts::default()));
-        self.line(
-            LineKind::App,
-            "No projects yet. Add one: add project <name> <path>".to_owned(),
+        self.app_line(LineKind::App, NO_PROJECTS.to_owned());
+        self.run_call(env::capture_call(), CallPurpose::EnvCapture);
+    }
+
+    fn handle(&mut self, message: Message) {
+        match message {
+            Message::Action(action) => self.handle_action(action),
+            Message::Pipe(id, event) => self.pipe(id, event),
+            Message::CallDone(purpose, done) => self.call_done(purpose, &done),
+        }
+    }
+
+    fn handle_action(&mut self, action: Action) {
+        if self.quitting.is_some() {
+            return;
+        }
+        match action {
+            Action::Submit { text, at } => self.submit(&text, at),
+            Action::StopAll => self.stop_all(),
+            Action::Metric(metric) => self.metric(metric),
+            Action::Quit => self.quit(),
+        }
+    }
+
+    fn submit(&mut self, line: &str, at: Instant) {
+        let refusal = match grammar::parse(line) {
+            Parsed::Empty => return,
+            Parsed::List => return self.list(),
+            Parsed::Intent(Intent::AddProject { name, path }) => {
+                return self.add_project(&name, &path);
+            }
+            Parsed::MentionOnly(name) => {
+                self.mention(name);
+                return;
+            }
+            Parsed::Request { mention, text } => {
+                if mention.is_none_or(|name| self.mention(name)) {
+                    self.request(&text, at);
+                }
+                return;
+            }
+            Parsed::TooLong { kb } => {
+                format!("This line is {kb} KB. The limit is {LINE_LIMIT_KB} KB.")
+            }
+            Parsed::Intent(intent) => not_built(intent.kind().words()),
+            Parsed::IntentUsage(kind) => usage(kind).to_owned(),
+            Parsed::BadMention(token) => format!("Not a valid name: @{token}."),
+            Parsed::SeveralMentions => {
+                "One target per request in this version. Send one line per target.".to_owned()
+            }
+        };
+        self.app_line(LineKind::Error, refusal);
+    }
+
+    fn list(&mut self) {
+        self.log("intent", &[("kind", LIST_WORDS)]);
+        for line in self.registry.list_lines() {
+            self.app_line(LineKind::App, line);
+        }
+    }
+
+    /// Sets the target when `name` is registered. Otherwise refuses the line
+    /// and returns `false`.
+    fn mention(&mut self, name: Name) -> bool {
+        if self.registry.find(&name).is_none() {
+            let known = self.known_names();
+            let known = if known.is_empty() {
+                "none yet".to_owned()
+            } else {
+                known.join(", ")
+            };
+            self.app_line(
+                LineKind::Error,
+                format!("Unknown name @{name}. Known names: {known}."),
+            );
+            return false;
+        }
+        self.log("target", &[("name", name.as_ref()), ("saved", "no")]);
+        self.emit(Event::Prompt {
+            label: Label::Project(name.to_string()),
+        });
+        self.target = Some(name);
+        true
+    }
+
+    fn known_names(&self) -> Vec<String> {
+        self.registry
+            .known_names()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn add_project(&mut self, typed_name: &str, typed_path: &str) {
+        self.log("intent", &[("kind", "add-project"), ("name", typed_name)]);
+        let EnvState::Ready { env, .. } = &self.env else {
+            return self.app_line(LineKind::Error, READING_ENVIRONMENT.to_owned());
+        };
+        let env = Arc::clone(env);
+        let Some(name) = Name::parse(typed_name) else {
+            return self.app_line(
+                LineKind::Error,
+                format!("Cannot add project {typed_name}: {NAME_RULE}."),
+            );
+        };
+        if let Some(holder) = self.registry.holder(&name) {
+            return self.app_line(LineKind::Error, format!("{name} is taken by {holder}."));
+        }
+        if self.adding.iter().any(|(adding, _)| *adding == name) {
+            return self.app_line(
+                LineKind::Error,
+                format!("{name} is being added. Wait for it to finish."),
+            );
+        }
+        let path = paths::expand_tilde(typed_path, &self.home_dir);
+        let other_projects = self
+            .registry
+            .projects()
+            .chain(
+                self.adding
+                    .iter()
+                    .map(|(name, path)| (name, path.as_path())),
+            )
+            .collect();
+        let rules = Rules {
+            home_dir: &self.home_dir,
+            app_home: &self.home.root,
+            claude_config_dir: env.claude_config_dir(),
+            other_projects,
+        };
+        let path = match paths::check(&path, &rules) {
+            Ok(path) => path,
+            Err(rule) => {
+                return self.app_line(
+                    LineKind::Error,
+                    format!("Cannot add project {name}: {rule}."),
+                );
+            }
+        };
+        self.adding.push((name.clone(), path.clone()));
+        let call = Call {
+            name: "git-branch",
+            argv: vec![
+                "git".into(),
+                "-C".into(),
+                path.clone().into(),
+                "rev-parse".into(),
+                "--abbrev-ref".into(),
+                "HEAD".into(),
+            ],
+            env: Some(env),
+            limit: worker::GIT_LIMIT,
+        };
+        self.run_call(call, CallPurpose::AddProject { name, path });
+    }
+
+    fn add_project_done(&mut self, name: Name, path: PathBuf, done: &ChildDone) {
+        self.adding.retain(|(adding, _)| *adding != name);
+        let kind = if done.succeeded() && !done.stdout_cut {
+            format!(
+                "git, branch {}",
+                String::from_utf8_lossy(&done.stdout).trim()
+            )
+        } else {
+            "not a git repository".to_owned()
+        };
+        let text = format!("Added project {name}: {} ({kind})", path.display());
+        self.registry = self.registry.with_project(Project { name, path });
+        self.app_line(LineKind::App, text);
+    }
+
+    fn request(&mut self, text: &str, at: Instant) {
+        let Some(target) = self.target.clone() else {
+            let example = self
+                .registry
+                .known_names()
+                .first()
+                .map_or_else(|| "<name>".to_owned(), ToString::to_string);
+            return self.app_line(
+                LineKind::Error,
+                format!(
+                    "No target. Start the line with a mention, for example: @{example} {}",
+                    text.trim_end()
+                ),
+            );
+        };
+        if matches!(self.env, EnvState::Reading) {
+            return self.app_line(LineKind::Error, READING_ENVIRONMENT.to_owned());
+        }
+        let live = self
+            .agents
+            .values()
+            .find(|agent| agent.target == target)
+            .map(|agent| agent.id);
+        let id = match live {
+            Some(id) => {
+                let agent = &self.agents[&id];
+                if agent.is_stopping() {
+                    return self.app_line(
+                        LineKind::Error,
+                        format!("{target} is stopping. Send the line again in a moment."),
+                    );
+                }
+                if agent.in_turn {
+                    return self.app_line(
+                        LineKind::Error,
+                        format!("{target} is working. Wait, or press ⌘. to stop it."),
+                    );
+                }
+                id
+            }
+            None => match self.start_agent(&target, at) {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        self.failed_targets.remove(&target);
+        let Some(mut agent) = self.agents.remove(&id) else {
+            return;
+        };
+        let line = agent::turn_line(text);
+        self.agent_log(&mut agent, Direction::In, &line);
+        if agent.handle.send(line) {
+            agent.in_turn = true;
+            agent.finished_turn = false;
+        } else {
+            self.write_failed(&mut agent, "its input is closed");
+        }
+        self.agents.insert(id, agent);
+    }
+
+    /// Starts an agent for `target`, or shows why it cannot start.
+    fn start_agent(&mut self, target: &Name, submitted: Instant) -> Option<AgentId> {
+        let EnvState::Ready { env, claude } = &self.env else {
+            return None;
+        };
+        let env = Arc::clone(env);
+        let Some(claude) = claude.clone() else {
+            self.app_line(LineKind::Error, claude_missing(&env));
+            return None;
+        };
+        let project = self.registry.find(target)?.clone();
+        let rules = Rules {
+            home_dir: &self.home_dir,
+            app_home: &self.home.root,
+            claude_config_dir: env.claude_config_dir(),
+            other_projects: self
+                .registry
+                .projects()
+                .filter(|(name, _)| *name != target)
+                .collect(),
+        };
+        let refusal = match paths::check(&project.path, &rules) {
+            Err(rule) => Some(rule.to_string()),
+            Ok(canonical) if canonical != project.path => Some(format!(
+                "{} now resolves to {}",
+                project.path.display(),
+                canonical.display()
+            )),
+            Ok(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            self.app_line(
+                LineKind::Error,
+                format!("Cannot start an agent for {target}: {refusal}."),
+            );
+            return None;
+        }
+
+        let id = AgentId(self.next_agent);
+        self.next_agent += 1;
+        let inbox = self.inbox.clone();
+        let notify = move |event| {
+            let _ = inbox.send(Message::Pipe(id, event));
+        };
+        let handle = match AgentHandle::spawn(&claude, &project.path, &env, notify) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.app_line(
+                    LineKind::Error,
+                    format!(
+                        "Could not start {} for {target}: {error}.",
+                        claude.display()
+                    ),
+                );
+                return None;
+            }
+        };
+        self.log_duration("submit_to_spawn_ms", submitted.elapsed());
+        let pid = handle.pid();
+        self.log(
+            "agent start",
+            &[
+                ("target", target.as_ref()),
+                ("pid", &pid.to_string()),
+                ("path", &project.path.display().to_string()),
+            ],
+        );
+        let log = match AgentLog::open(
+            &self.home.agent_logs(),
+            target.as_ref(),
+            SystemTime::now(),
+            pid,
+        ) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                self.app_line(
+                    LineKind::Error,
+                    format!("Could not open the agent log for {target}: {error}."),
+                );
+                None
+            }
+        };
+        if !self.started_targets.insert(target.clone()) {
+            self.agent_line(
+                target,
+                LineKind::App,
+                "new agent started. It does not remember earlier requests.".to_owned(),
+            );
+        }
+        self.agents.insert(
+            id,
+            Agent {
+                id,
+                target: target.clone(),
+                path: project.path,
+                handle,
+                log,
+                log_failed: false,
+                submitted,
+                first_line_seen: false,
+                in_turn: false,
+                waiting: Vec::new(),
+                finished_turn: false,
+                stop: None,
+                interrupted: false,
+                writer_alive: true,
+                stdout_ended: false,
+                stderr_ended: false,
+                exit: None,
+                stderr_tail: VecDeque::new(),
+            },
+        );
+        Some(id)
+    }
+
+    fn pipe(&mut self, id: AgentId, event: PipeEvent) {
+        let Some(mut agent) = self.agents.remove(&id) else {
+            return;
+        };
+        match event {
+            PipeEvent::Stdout(line) => self.stdout_line(&mut agent, &line),
+            PipeEvent::Stderr(line) => {
+                self.agent_log(&mut agent, Direction::Err, &line);
+                if agent.stderr_tail.len() == STDERR_TAIL_LINES {
+                    agent.stderr_tail.pop_front();
+                }
+                agent.stderr_tail.push_back(line);
+            }
+            PipeEvent::StdoutEnded => {
+                agent.stdout_ended = true;
+                self.poll_exit(&mut agent, Instant::now());
+                if !agent.is_stopping() {
+                    self.deny_waiting(&mut agent);
+                    agent.stop = Some(StopSteps::after_closed_output(Instant::now()));
+                }
+            }
+            PipeEvent::StderrEnded => agent.stderr_ended = true,
+            PipeEvent::LineTooLarge { mib } => {
+                self.agent_line(
+                    &agent.target,
+                    LineKind::Error,
+                    format!("Output line too large ({mib} MiB)."),
+                );
+                self.begin_stop(&mut agent, Instant::now());
+            }
+            PipeEvent::WriteFailed(error) => {
+                agent.writer_alive = false;
+                self.write_failed(&mut agent, &error);
+            }
+        }
+        self.agents.insert(id, agent);
+    }
+
+    fn write_failed(&mut self, agent: &mut Agent, error: &str) {
+        self.log(
+            "write_failed",
+            &[("target", agent.target.as_ref()), ("error", error)],
+        );
+        if agent.is_stopping() {
+            return;
+        }
+        self.app_line(
+            LineKind::Error,
+            format!("Could not send to {}: {error}.", agent.target),
+        );
+        self.begin_stop(agent, Instant::now());
+    }
+
+    fn stdout_line(&mut self, agent: &mut Agent, line: &str) {
+        self.agent_log(agent, Direction::Out, line);
+        if !agent.first_line_seen {
+            agent.first_line_seen = true;
+            self.log_duration("submit_to_first_line_ms", agent.submitted.elapsed());
+        }
+        let mapped = stream::map(
+            line,
+            &stream::Context {
+                target: agent.target.as_ref(),
+                path: &agent.path,
+                interrupted: agent.interrupted,
+            },
+        );
+        for shown in mapped.shown {
+            self.agent_line(&agent.target, shown.kind, shown.text);
+        }
+        if let Some(effect) = mapped.effect {
+            self.apply_effect(agent, effect);
+        }
+    }
+
+    fn apply_effect(&mut self, agent: &mut Agent, effect: Effect) {
+        let now = Instant::now();
+        match effect {
+            Effect::Init {
+                cwd,
+                permission_mode,
+                session_id,
+            } => self.check_init(agent, &cwd, &permission_mode, &session_id),
+            Effect::Working => agent.in_turn |= agent.stop.is_none(),
+            Effect::Permission(request) => self.permission(agent, request),
+            Effect::TurnDone | Effect::TurnFailed | Effect::InterruptedResult => {
+                agent.in_turn = false;
+                agent.finished_turn = matches!(effect, Effect::TurnDone) && agent.stop.is_none();
+                if let Some(step) = agent.stop.as_mut().and_then(|stop| stop.on_result(now)) {
+                    self.take_step(agent, step);
+                }
+            }
+        }
+    }
+
+    /// The agent must run in its target path and ask for permissions, so no
+    /// user setting moves it out of its path or past its prompts.
+    fn check_init(&mut self, agent: &mut Agent, cwd: &str, mode: &str, session_id: &str) {
+        self.log(
+            "agent init",
+            &[
+                ("target", agent.target.as_ref()),
+                ("pid", &agent.handle.pid().to_string()),
+                ("session_id", session_id),
+                ("cwd", cwd),
+                ("mode", mode),
+            ],
+        );
+        let mut mismatches = Vec::new();
+        if !agent::same_directory(cwd, &agent.path) {
+            mismatches.push(format!(
+                "{} started in {cwd}, not in {}. New Terminal stops it.",
+                agent.target,
+                agent.path.display()
+            ));
+        }
+        if mode != EXPECTED_PERMISSION_MODE {
+            mismatches.push(format!(
+                "{} started in permission mode {mode}, not {EXPECTED_PERMISSION_MODE}. New Terminal stops it.",
+                agent.target
+            ));
+        }
+        if mismatches.is_empty() {
+            return;
+        }
+        for mismatch in mismatches {
+            self.agent_line(&agent.target, LineKind::Error, mismatch);
+        }
+        self.begin_stop(agent, Instant::now());
+    }
+
+    /// Every request waits for the author, who can end it only with `⌘.`
+    /// for now. A stopping agent gets an immediate deny.
+    fn permission(&mut self, agent: &mut Agent, request: PermissionRequest) {
+        if agent.is_stopping() {
+            return self.deny_stopped(agent, None, &request);
+        }
+        let item = ItemId(self.next_item);
+        self.next_item += 1;
+        self.agent_line(&agent.target, LineKind::Attention, request.summary.clone());
+        agent.waiting.push(Waiting { item, request });
+    }
+
+    fn deny_waiting(&mut self, agent: &mut Agent) {
+        for waiting in std::mem::take(&mut agent.waiting) {
+            self.deny_stopped(agent, Some(waiting.item), &waiting.request);
+        }
+    }
+
+    fn deny_stopped(
+        &mut self,
+        agent: &mut Agent,
+        item: Option<ItemId>,
+        request: &PermissionRequest,
+    ) {
+        let line = agent::deny_line(&request.request_id, STOPPED_BY_USER);
+        self.agent_log(agent, Direction::In, &line);
+        // A failed send means the writer is gone, and the process is ending.
+        let _ = agent.handle.send(line);
+        let item = item.map_or_else(|| "none".to_owned(), |ItemId(id)| id.to_string());
+        self.log(
+            "permission",
+            &[
+                ("target", agent.target.as_ref()),
+                ("tool", &request.tool),
+                ("decision", "stop-deny"),
+                ("setup", "no"),
+                ("item", &item),
+                ("input", &request.input.to_string()),
+            ],
         );
     }
 
-    fn handle(&mut self, action: Action) -> Flow {
-        match action {
-            Action::Submit(line) => self.submit(&line),
-            Action::StopAll => self.line(LineKind::Error, "No agents are running.".to_owned()),
-            Action::Metric(metric) => self.metric(metric),
-            Action::Quit => {
-                self.quit();
-                return Flow::End;
-            }
+    fn stop_all(&mut self) {
+        if self.agents.is_empty() {
+            return self.app_line(LineKind::Error, "No agents are running.".to_owned());
         }
-        Flow::Continue
+        let now = Instant::now();
+        self.stop_all_at.get_or_insert(now);
+        self.stop_every_agent(now);
     }
 
-    fn submit(&self, line: &str) {
-        if let Some(refusal) = refusal(grammar::parse(line)) {
-            self.line(LineKind::Error, refusal);
+    fn stop_every_agent(&mut self, now: Instant) {
+        let ids: Vec<AgentId> = self.agents.keys().copied().collect();
+        for id in ids {
+            if let Some(mut agent) = self.agents.remove(&id) {
+                self.begin_stop(&mut agent, now);
+                self.agents.insert(id, agent);
+            }
         }
+    }
+
+    /// Stop step 1, then step 2 or 3. Does nothing for an agent that is
+    /// already stopping or has exited.
+    fn begin_stop(&mut self, agent: &mut Agent, now: Instant) {
+        if agent.is_stopping() {
+            return;
+        }
+        self.deny_waiting(agent);
+        let (stop, step) = StopSteps::begin(now, agent.in_turn && agent.writer_alive);
+        agent.stop = Some(stop);
+        self.take_step(agent, step);
+    }
+
+    fn take_step(&self, agent: &mut Agent, step: Step) {
+        match step {
+            Step::SendInterrupt => {
+                agent.interrupted = true;
+                let line = agent::interrupt_line(&format!("nt-interrupt-{}", agent.id));
+                self.agent_log(agent, Direction::In, &line);
+                // A failed send leaves the 3 s wait to move the steps on.
+                let _ = agent.handle.send(line);
+            }
+            Step::Terminate => agent.handle.signal(Signal::SIGTERM),
+            Step::Kill => {
+                agent.handle.signal(Signal::SIGKILL);
+                self.agent_line(
+                    &agent.target,
+                    LineKind::Warning,
+                    format!(
+                        "{} did not stop on SIGTERM and was killed. Commands it started in the background can still be running.",
+                        agent.target
+                    ),
+                );
+            }
+        }
+    }
+
+    fn quit(&mut self) {
+        if let Some(summary) = self.keypresses.flush() {
+            self.log_keypresses(summary);
+        }
+        self.log("quit", &[]);
+        self.quitting = Some(Quitting { calls_until: None });
+        self.stop_every_agent(Instant::now());
+    }
+
+    /// Reaps exits, runs due stop steps, shows finished exits, and ends the
+    /// core once quit has finished.
+    fn tick(&mut self, now: Instant) -> Flow {
+        let ids: Vec<AgentId> = self.agents.keys().copied().collect();
+        for id in ids {
+            let Some(mut agent) = self.agents.remove(&id) else {
+                continue;
+            };
+            self.poll_exit(&mut agent, now);
+            if agent.exit.is_none()
+                && let Some(step) = agent.stop.as_mut().and_then(|stop| stop.on_deadline(now))
+            {
+                self.take_step(&mut agent, step);
+            }
+            match agent.exit {
+                Some((_, exited))
+                    if (agent.stdout_ended && agent.stderr_ended)
+                        || now >= exited + EXIT_SHOW_WAIT =>
+                {
+                    self.finish(agent);
+                }
+                _ => {
+                    self.agents.insert(id, agent);
+                }
+            }
+        }
+        self.finish_quit(now)
+    }
+
+    fn poll_exit(&mut self, agent: &mut Agent, now: Instant) {
+        if agent.exit.is_some() {
+            return;
+        }
+        match agent.handle.try_wait() {
+            Ok(Some(status)) => agent.exit = Some((status, now)),
+            Ok(None) => {}
+            Err(error) => self.log(
+                "wait_failed",
+                &[
+                    ("target", agent.target.as_ref()),
+                    ("error", &error.to_string()),
+                ],
+            ),
+        }
+    }
+
+    /// Shows how the agent ended and drops its record. The process is
+    /// reaped, so dropping the handle sends no signal, and the stdin
+    /// writer's channel closes.
+    fn finish(&mut self, agent: Agent) {
+        let Some((status, exited)) = agent.exit else {
+            return;
+        };
+        let target = agent.target.as_ref();
+        let pid = agent.handle.pid().to_string();
+        let status_field = worker::status_field(status);
+        // An agent that closed its output and then exited by itself got no
+        // stop signal, so it gets no stop line.
+        if let Some(stop) = agent
+            .stop
+            .filter(|stop| !stop.closed_output() || stop.signal() != SignalSent::None)
+        {
+            self.log(
+                "stop",
+                &[
+                    ("target", target),
+                    ("pid", &pid),
+                    ("signal", stop.signal().field()),
+                ],
+            );
+        }
+        let by_stop = agent.stop.is_some_and(|stop| !stop.closed_output());
+        if by_stop {
+            self.agent_line(&agent.target, LineKind::Stopped, "stopped".to_owned());
+        } else {
+            self.agent_line(&agent.target, LineKind::Failed, worker::status_text(status));
+            for line in &agent.stderr_tail {
+                self.agent_line(&agent.target, LineKind::Error, line.clone());
+            }
+            self.failed_targets.insert(agent.target.clone());
+        }
+        self.log(
+            "agent exit",
+            &[
+                ("target", target),
+                ("pid", &pid),
+                ("status", &status_field),
+                ("by", if by_stop { "stop" } else { "self" }),
+            ],
+        );
+        if self.agents.is_empty()
+            && let Some(started) = self.stop_all_at.take()
+        {
+            self.log_duration("stop_ms", exited.saturating_duration_since(started));
+        }
+        drop(agent);
+    }
+
+    /// Once quit has ended every agent, tells the child calls to stop, waits
+    /// a short time for their reports, and ends.
+    fn finish_quit(&mut self, now: Instant) -> Flow {
+        let Some(quitting) = &mut self.quitting else {
+            return Flow::Continue;
+        };
+        if !self.agents.is_empty() {
+            return Flow::Continue;
+        }
+        let until = *quitting.calls_until.get_or_insert_with(|| {
+            self.quit_flag.store(true, Ordering::Relaxed);
+            now + QUIT_CALL_WAIT
+        });
+        if self.calls_running > 0 && now < until {
+            return Flow::Continue;
+        }
+        self.log("quit done", &[]);
+        Flow::End
+    }
+
+    /// The nearest moment the actor must act without a message.
+    fn next_wake(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let agent_wakes = self.agents.values().flat_map(|agent| {
+            let poll = agent.exit.is_none().then_some(now + EXIT_POLL);
+            let show = agent.exit.map(|(_, exited)| exited + EXIT_SHOW_WAIT);
+            let stop = agent.stop.and_then(|stop| stop.deadline());
+            [poll, show, stop]
+        });
+        let quit_wake = self
+            .quitting
+            .as_ref()
+            .and_then(|quitting| quitting.calls_until);
+        agent_wakes.chain([quit_wake]).flatten().min()
+    }
+
+    fn run_call(&mut self, call: Call, purpose: CallPurpose) {
+        self.calls_running += 1;
+        let inbox = self.inbox.clone();
+        worker::run(call, Arc::clone(&self.quit_flag), move |done| {
+            let _ = inbox.send(Message::CallDone(purpose, done));
+        });
+    }
+
+    fn call_done(&mut self, purpose: CallPurpose, done: &ChildDone) {
+        self.calls_running -= 1;
+        let ms = whole_ms_rounded_up(done.elapsed).to_string();
+        let exit = done.exit_field();
+        self.log(
+            "child",
+            &[
+                ("call", done.name),
+                ("exit", &exit),
+                ("ms", &ms),
+                ("cut", done.cut_field()),
+            ],
+        );
+        if done.timed_out {
+            self.log("timeout", &[("call", done.name)]);
+        }
+        if self.quitting.is_some() {
+            return;
+        }
+        match purpose {
+            CallPurpose::EnvCapture => self.env_done(done),
+            CallPurpose::ClaudeVersion(path) => {
+                let version = if done.succeeded() {
+                    String::from_utf8_lossy(&done.stdout).trim().to_owned()
+                } else {
+                    "unknown".to_owned()
+                };
+                self.log(
+                    "claude",
+                    &[("path", &path.display().to_string()), ("version", &version)],
+                );
+            }
+            CallPurpose::AddProject { name, path } => self.add_project_done(name, path, done),
+        }
+    }
+
+    fn env_done(&mut self, done: &ChildDone) {
+        let ms = whole_ms_rounded_up(done.elapsed).to_string();
+        let env = match env::parse_capture(done) {
+            Ok(env) => {
+                self.log("env ok", &[("env_capture_ms", &ms)]);
+                env
+            }
+            Err(reason) => {
+                self.log(
+                    "env failed",
+                    &[("reason", &reason), ("env_capture_ms", &ms)],
+                );
+                self.app_line(
+                    LineKind::Warning,
+                    format!(
+                        "Could not read your shell environment ({reason}). New Terminal uses its own environment."
+                    ),
+                );
+                Environment::own()
+            }
+        };
+        let env = Arc::new(env);
+        let claude = env.find_program("claude");
+        if let Some(path) = &claude {
+            let call = Call {
+                name: "claude-version",
+                argv: vec![path.into(), "--version".into()],
+                env: Some(Arc::clone(&env)),
+                limit: worker::SHORT_LIMIT,
+            };
+            self.run_call(call, CallPurpose::ClaudeVersion(path.clone()));
+        } else {
+            self.log("claude missing", &[]);
+            self.app_line(LineKind::Warning, claude_missing(&env));
+        }
+        self.env = EnvState::Ready { env, claude };
     }
 
     fn metric(&mut self, metric: Metric) {
@@ -166,12 +1107,31 @@ impl Actor {
         }
     }
 
-    fn quit(&mut self) {
-        if let Some(summary) = self.keypresses.flush() {
-            self.log_keypresses(summary);
+    fn counts(&self) -> Counts {
+        let live = || self.agents.values().filter(|agent| agent.exit.is_none());
+        Counts {
+            projects: self.registry.project_count(),
+            workspaces: 0,
+            working: live()
+                .filter(|agent| agent.in_turn && agent.stop.is_none())
+                .count(),
+            needs_you: self
+                .agents
+                .values()
+                .map(|agent| agent.waiting.len() + usize::from(agent.finished_turn))
+                .sum(),
+            failed: self.failed_targets.len(),
+            agents_alive: live().count(),
+            any_agent_started: !self.started_targets.is_empty(),
         }
-        self.log("quit", &[]);
-        self.log("quit done", &[]);
+    }
+
+    fn send_counts(&mut self) {
+        let counts = self.counts();
+        if counts != self.sent_counts {
+            self.sent_counts = counts;
+            self.emit(Event::Status(counts));
+        }
     }
 
     fn log_duration(&mut self, name: &str, elapsed: Duration) {
@@ -201,13 +1161,39 @@ impl Actor {
                 "Could not write {}: {error}. Later log lines may be lost.",
                 self.home.app_log().display()
             );
-            self.line(LineKind::Error, text);
+            self.app_line(LineKind::Error, text);
         }
     }
 
-    fn line(&self, kind: LineKind, text: String) {
+    /// Writes one raw line to the agent's log. The first failed write shows
+    /// one warning for that agent.
+    fn agent_log(&self, agent: &mut Agent, direction: Direction, line: &str) {
+        let Some(log) = &mut agent.log else {
+            return;
+        };
+        if let Err(error) = log.write(direction, line)
+            && !agent.log_failed
+        {
+            agent.log_failed = true;
+            let text = format!(
+                "Could not write {}: {error}. Later agent log lines may be lost.",
+                log.path().display()
+            );
+            self.agent_line(&agent.target, LineKind::Warning, text);
+        }
+    }
+
+    fn app_line(&self, kind: LineKind, text: String) {
         self.emit(Event::Line {
             source: Source::App,
+            kind,
+            text,
+        });
+    }
+
+    fn agent_line(&self, target: &Name, kind: LineKind, text: String) {
+        self.emit(Event::Line {
+            source: Source::Target(target.to_string()),
             kind,
             text,
         });
@@ -220,43 +1206,12 @@ impl Actor {
     }
 }
 
-/// The one error line for a submitted line, or `None` when the line asks for
-/// nothing.
-fn refusal(parsed: Parsed) -> Option<String> {
-    let text = match parsed {
-        Parsed::Empty => return None,
-        Parsed::TooLong { kb } => {
-            format!("This line is {kb} KB. The limit is {LINE_LIMIT_KB} KB.")
-        }
-        Parsed::List => not_built(LIST_WORDS),
-        Parsed::Intent(kind) => not_built(kind.words()),
-        Parsed::IntentUsage(kind) => usage(kind).to_owned(),
-        Parsed::MentionOnly(name)
-        | Parsed::Request {
-            mention: Some(name),
-            ..
-        } => unknown_name(&name),
-        Parsed::Request {
-            mention: None,
-            text,
-        } => format!(
-            "No target. Start the line with a mention, for example: @<name> {}",
-            text.trim_end()
-        ),
-        Parsed::BadMention(token) => format!("Not a valid name: @{token}."),
-        Parsed::SeveralMentions => {
-            "One target per request in this version. Send one line per target.".to_owned()
-        }
-    };
-    Some(text)
+fn claude_missing(env: &Environment) -> String {
+    format!("`claude` was not found on PATH ({}).", env.path_text())
 }
 
 fn not_built(intent_words: &str) -> String {
     format!("{intent_words} is not built yet. Nothing changed.")
-}
-
-fn unknown_name(name: &Name) -> String {
-    format!("Unknown name @{name}. Known names: none yet.")
 }
 
 const fn usage(kind: IntentKind) -> &'static str {

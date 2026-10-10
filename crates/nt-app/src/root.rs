@@ -18,6 +18,7 @@ const PROMPT_MAX_ROWS: usize = 8;
 const FONT: &str = "Menlo";
 const EDGE_PADDING: f32 = 8.;
 const STATUS_SEPARATOR: &str = " │ ";
+const STATUS_KEYS_GAP: &str = "  ";
 
 pub struct Root {
     core: CoreHandle,
@@ -163,7 +164,10 @@ impl Render for Root {
                     .gap(px(EDGE_PADDING))
                     .child(
                         div()
-                            .text_color(palette.dim)
+                            .text_color(match self.label {
+                                Label::NoTarget => palette.dim,
+                                Label::Project(_) => palette.text,
+                            })
                             .child(prompt_label(&self.label)),
                     )
                     .child(div().flex_1().child(Textarea::new(&self.prompt))),
@@ -176,18 +180,35 @@ impl Render for Root {
     }
 }
 
-const fn prompt_label(label: &Label) -> &'static str {
+fn prompt_label(label: &Label) -> String {
     match label {
-        Label::NoTarget => "no target ›",
+        Label::NoTarget => "no target ›".to_owned(),
+        Label::Project(name) => format!("{name} ›"),
     }
 }
 
+/// `working` shows once any agent has started, so `0 working` confirms a
+/// stop. `needs you` and `failed` show only when above 0.
 fn status_line(counts: Counts) -> String {
-    [
+    let mut parts = vec![
         count(counts.projects, "project"),
         count(counts.workspaces, "workspace"),
-    ]
-    .join(STATUS_SEPARATOR)
+    ];
+    if counts.any_agent_started {
+        parts.push(format!("{} working", counts.working));
+    }
+    if counts.needs_you > 0 {
+        parts.push(format!("{} needs you", counts.needs_you));
+    }
+    if counts.failed > 0 {
+        parts.push(format!("{} failed", counts.failed));
+    }
+    let mut line = parts.join(STATUS_SEPARATOR);
+    if counts.agents_alive > 0 {
+        line.push_str(STATUS_KEYS_GAP);
+        line.push_str("⌘. stop");
+    }
+    line
 }
 
 fn count(n: usize, noun: &str) -> String {

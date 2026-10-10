@@ -22,7 +22,10 @@ const NO_BREAK_SPACE: char = '\u{a0}';
 #[derive(Clone, Copy, Debug)]
 enum Tone {
     Text,
+    Dim,
+    Accent,
     Error,
+    Warning,
 }
 
 #[derive(Debug)]
@@ -57,11 +60,17 @@ impl Scrollback {
             Source::App => "nt",
             Source::Target(name) => name,
         };
-        let tone = match kind {
-            LineKind::App => Tone::Text,
-            LineKind::Error => Tone::Error,
+        let (prefix, tone) = match kind {
+            LineKind::App | LineKind::AgentText => (format!("{label} │ "), Tone::Text),
+            LineKind::Error => (format!("{label} │ "), Tone::Error),
+            LineKind::Warning => (format!("{label} │ "), Tone::Warning),
+            LineKind::Tool => (format!("{label} │ "), Tone::Dim),
+            LineKind::Attention => (format!("? {label}  "), Tone::Accent),
+            LineKind::Done => (format!("✓ {label} "), Tone::Accent),
+            LineKind::Stopped => (format!("■ {label} "), Tone::Text),
+            LineKind::Failed => (format!("✗ {label} failed: "), Tone::Error),
         };
-        self.push(&format!("{label} │ "), text, tone);
+        self.push(&prefix, text, tone);
     }
 
     /// Adds the author's own submitted text.
@@ -101,7 +110,10 @@ impl Scrollback {
         let palette = cx.global::<Palette>();
         let color = match row.tone {
             Tone::Text => palette.text,
+            Tone::Dim => palette.dim,
+            Tone::Accent => palette.accent,
             Tone::Error => palette.error,
+            Tone::Warning => palette.warning,
         };
         let style = TextViewStyle::from_theme(&Theme::global(cx))
             .with_foreground(color)

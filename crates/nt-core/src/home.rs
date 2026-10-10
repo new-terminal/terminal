@@ -18,6 +18,10 @@ impl Home {
     pub fn app_log(&self) -> PathBuf {
         self.root.join("logs").join("app.log")
     }
+
+    pub fn agent_logs(&self) -> PathBuf {
+        self.root.join("logs").join("agents")
+    }
 }
 
 /// The home could not be made. Carries the path as given.

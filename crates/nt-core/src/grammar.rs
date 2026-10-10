@@ -11,7 +11,7 @@ const NAME_MAX_CHARS: usize = 32;
 
 /// A project or workspace name: lowercase ASCII letters, digits, and hyphens,
 /// 1 to 32 characters, starting with a letter or a digit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name(String);
 
 impl Name {
@@ -24,6 +24,15 @@ impl Name {
         let rest_valid = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
         let length_valid = text.len() <= NAME_MAX_CHARS;
         (starts_well && rest_valid && length_valid).then(|| Self(text.to_owned()))
+    }
+}
+
+/// The name rule, worded for a refusal.
+pub const NAME_RULE: &str = "a name uses lowercase letters, digits, and hyphens, 1 to 32 characters, and starts with a letter or a digit";
+
+impl AsRef<str> for Name {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -56,6 +65,29 @@ impl IntentKind {
     }
 }
 
+/// A well-formed app intent with its arguments as typed. Names are not
+/// checked here, so a refusal can name the rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// `path` is the rest of the line, so it may hold spaces.
+    AddProject {
+        name: String,
+        path: String,
+    },
+    NewWorkspace,
+    ArchiveWorkspace,
+}
+
+impl Intent {
+    pub const fn kind(&self) -> IntentKind {
+        match self {
+            Self::AddProject { .. } => IntentKind::AddProject,
+            Self::NewWorkspace => IntentKind::NewWorkspace,
+            Self::ArchiveWorkspace => IntentKind::ArchiveWorkspace,
+        }
+    }
+}
+
 /// What one line asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
@@ -65,7 +97,7 @@ pub enum Parsed {
     },
     /// The line is [`LIST_WORDS`] alone.
     List,
-    Intent(IntentKind),
+    Intent(Intent),
     /// The line starts with an intent's words, but its arguments do not fit.
     IntentUsage(IntentKind),
     MentionOnly(Name),
@@ -104,26 +136,33 @@ fn parse_intent(line: &str) -> Option<Parsed> {
     let typed = format!("{first} {second}");
     let starts_with = |kind: IntentKind| typed.eq_ignore_ascii_case(kind.words());
     let word_count = arguments.split_whitespace().count();
-    let (kind, fits) = if starts_with(IntentKind::AddProject) {
-        (IntentKind::AddProject, add_project_fits(arguments))
+    let (kind, intent) = if starts_with(IntentKind::AddProject) {
+        (IntentKind::AddProject, add_project(arguments))
     } else if starts_with(IntentKind::NewWorkspace) {
-        (IntentKind::NewWorkspace, word_count == 2)
+        (
+            IntentKind::NewWorkspace,
+            (word_count == 2).then_some(Intent::NewWorkspace),
+        )
     } else if starts_with(IntentKind::ArchiveWorkspace) {
-        (IntentKind::ArchiveWorkspace, word_count == 1)
+        (
+            IntentKind::ArchiveWorkspace,
+            (word_count == 1).then_some(Intent::ArchiveWorkspace),
+        )
     } else {
         return None;
     };
-    Some(if fits {
-        Parsed::Intent(kind)
-    } else {
-        Parsed::IntentUsage(kind)
-    })
+    Some(intent.map_or(Parsed::IntentUsage(kind), Parsed::Intent))
 }
 
 /// `<name> <path>`, where the path is the rest of the line, so it may hold
 /// spaces.
-fn add_project_fits(arguments: &str) -> bool {
-    split_word(arguments).is_some_and(|(_, path)| !path.trim_end().is_empty())
+fn add_project(arguments: &str) -> Option<Intent> {
+    let (name, path) = split_word(arguments)?;
+    let path = path.trim_end();
+    (!path.is_empty()).then(|| Intent::AddProject {
+        name: name.to_owned(),
+        path: path.to_owned(),
+    })
 }
 
 fn parse_mentions(line: &str) -> Parsed {
