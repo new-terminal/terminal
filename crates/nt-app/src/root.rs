@@ -1,28 +1,47 @@
 //! The root view: the scrollback, the prompt, and the status bar, top to
-//! bottom, and the speed metrics. In reply mode the prompt shows a waiting
-//! permission's question in place of the input and takes only its answer.
+//! bottom, and the speed metrics. In reply mode the scrollback shows the
+//! waiting permission as the request block, and the keys and the block's
+//! buttons take only its answer.
 
 use std::time::Instant;
 
 use gpui_kit::base::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, IntoElement, Keystroke,
-    ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
+    App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, IntoElement,
+    Keystroke, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
 };
 use nt_core::{
     CoreHandle, Counts, Decision, Event, Events, Label, LineKind, Metric, Reply, Source,
 };
 
 use crate::palette::Palette;
+use crate::request::{self, Choice};
 use crate::scrollback::Scrollback;
+use crate::typeface::{MONO, SANS};
 
 const PROMPT_MIN_ROWS: usize = 1;
 const PROMPT_MAX_ROWS: usize = 8;
-const FONT: &str = "Menlo";
-const EDGE_PADDING: f32 = 8.;
-const STATUS_SEPARATOR: &str = " │ ";
-const STATUS_KEYS_GAP: &str = "  ";
 const REPLY_HINT: &str = "Answer with y or n, or press Esc.";
+const MARGIN_X: f32 = 56.;
+const SCROLLBACK_PAD_TOP: f32 = 14.;
+const SCROLLBACK_PAD_BOTTOM: f32 = 8.;
+const PROMPT_PAD_TOP: f32 = 6.;
+const PROMPT_WIDTH: f32 = 1000.;
+const PROMPT_GAP: f32 = 10.;
+const PROMPT_ROW_PAD_TOP: f32 = 8.;
+const PROMPT_ROW_PAD_BOTTOM: f32 = 10.;
+const PROMPT_SIZE: f32 = 15.;
+const PROMPT_LINE: f32 = 24.;
+const CARET_WIDTH: f32 = 9.;
+const CARET_HEIGHT: f32 = 20.;
+/// Centers the caret block on the prompt's first line.
+const CARET_DROP: f32 = (PROMPT_LINE - CARET_HEIGHT) / 2.;
+const STATUS_GAP: f32 = 28.;
+const STATUS_PAD_TOP: f32 = 10.;
+const STATUS_PAD_BOTTOM: f32 = 14.;
+const STATUS_SIZE: f32 = 12.;
+const STATUS_LINE: f32 = 20.;
+const STATUS_MARK_GAP: f32 = 8.;
 
 pub struct Root {
     core: CoreHandle,
@@ -34,6 +53,10 @@ pub struct Root {
     counts: Counts,
     launched: Instant,
     cold_start_sent: bool,
+    /// Set while the window shows the demo scene, which core events must
+    /// not change.
+    #[cfg(debug_assertions)]
+    demo: bool,
     _subscriptions: Vec<Subscription>,
     _pump: Task<()>,
 }
@@ -78,6 +101,11 @@ impl Root {
             }
         });
         let scrollback = cx.new(|_| Scrollback::new());
+        let on_button = cx.subscribe_in(
+            &scrollback,
+            window,
+            |this, _, choice: &Choice, window, cx| this.choose(*choice, window, cx),
+        );
         let pump = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
@@ -97,13 +125,29 @@ impl Root {
             counts: Counts::default(),
             launched,
             cold_start_sent: false,
-            _subscriptions: vec![on_enter, on_key, on_answer_key],
+            #[cfg(debug_assertions)]
+            demo: false,
+            _subscriptions: vec![on_enter, on_key, on_answer_key, on_button],
             _pump: pump,
         }
     }
 
     pub fn focus_prompt(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.focus(&self.prompt_focus(cx), cx);
+    }
+
+    /// Fills the window with the demo scene and keeps core events from
+    /// changing it.
+    #[cfg(debug_assertions)]
+    pub fn show_demo(&mut self, cx: &mut Context<'_, Self>) {
+        self.demo = true;
+        self.label = crate::demo::label();
+        self.counts = crate::demo::counts();
+        self.scrollback.update(cx, |scrollback, cx| {
+            crate::demo::stage(scrollback);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn prompt_focus(&self, cx: &App) -> FocusHandle {
@@ -143,39 +187,71 @@ impl Root {
             return false;
         }
         let plain = !keystroke.modifiers.modified();
-        let Some(reply) = &self.reply else {
+        if self.reply.is_none() {
             let empty = self.prompt.read(cx).value().is_empty();
             if keystroke.key == "tab" && plain && empty {
                 self.core.bring_up();
                 return true;
             }
             return false;
-        };
-        let item = reply.item;
-        match keystroke.key.as_str() {
-            "y" if plain => self.core.answer(item, Decision::Allow),
-            "n" if plain => self.core.answer(item, Decision::Deny),
-            "escape" if plain => self.core.later(item),
+        }
+        let choice = match keystroke.key.as_str() {
+            "y" if plain => Choice::Allow,
+            "n" if plain => Choice::Deny,
+            "escape" if plain => Choice::Later,
             _ => {
                 self.push_line(&Source::App, LineKind::App, REPLY_HINT, cx);
                 return true;
             }
-        }
-        self.leave_reply_mode(window, cx);
+        };
+        self.choose(choice, window, cx);
         true
     }
 
-    /// Shows the input again, with the text it held, and focuses it.
+    /// Answers the permission reply mode shows, the same way from a key or
+    /// a button. Does nothing outside reply mode.
+    fn choose(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(reply) = &self.reply else {
+            return;
+        };
+        let item = reply.item;
+        match choice {
+            Choice::Allow => self.core.answer(item, Decision::Allow),
+            Choice::Deny => self.core.answer(item, Decision::Deny),
+            Choice::Later => self.core.later(item),
+        }
+        self.leave_reply_mode(window, cx);
+    }
+
+    /// Takes the request block's buttons away, and focuses the input again
+    /// with the text it held.
     fn leave_reply_mode(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.reply = None;
+        self.scrollback.update(cx, |scrollback, cx| {
+            scrollback.settle_request();
+            cx.notify();
+        });
         self.focus_prompt(window, cx);
         cx.notify();
     }
 
     fn apply(&mut self, event: Event, window: &mut Window, cx: &mut Context<'_, Self>) {
+        #[cfg(debug_assertions)]
+        if self.demo {
+            return;
+        }
         match event {
             Event::Line { source, kind, text } => self.push_line(&source, kind, &text, cx),
             Event::Prompt { label, reply } => {
+                if let Some(new) = &reply
+                    && self.reply.as_ref().map(|shown| shown.item) != Some(new.item)
+                {
+                    let target = target_name(&label);
+                    self.scrollback.update(cx, |scrollback, cx| {
+                        scrollback.raise_request(target, &new.question);
+                        cx.notify();
+                    });
+                }
                 self.label = label;
                 if reply.is_none() && self.reply.is_some() {
                     self.leave_reply_mode(window, cx);
@@ -206,6 +282,50 @@ impl Root {
             core.metric(Metric::ColdStart(launched.elapsed()));
         });
     }
+
+    /// The one prompt: the target, the caret block, and the input, over a
+    /// single rule.
+    fn render_prompt(&self, palette: &Palette) -> Div {
+        let label_color = match self.label {
+            Label::NoTarget => palette.muted,
+            Label::Project(_) | Label::Workspace { .. } => palette.ink,
+        };
+        div()
+            .flex_shrink_0()
+            .px(px(MARGIN_X))
+            .pt(px(PROMPT_PAD_TOP))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(PROMPT_WIDTH))
+                    .flex()
+                    .items_start()
+                    .gap(px(PROMPT_GAP))
+                    .pt(px(PROMPT_ROW_PAD_TOP))
+                    .pb(px(PROMPT_ROW_PAD_BOTTOM))
+                    .border_b_2()
+                    .border_color(palette.ink)
+                    .font_family(MONO)
+                    .text_size(px(PROMPT_SIZE))
+                    .line_height(px(PROMPT_LINE))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .text_color(label_color)
+                            .child(prompt_label(&self.label)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .mt(px(CARET_DROP))
+                            .w(px(CARET_WIDTH))
+                            .h(px(CARET_HEIGHT))
+                            .bg(palette.accent),
+                    )
+                    .child(div().flex_1().min_w_0().child(Textarea::new(&self.prompt))),
+            )
+    }
 }
 
 impl Render for Root {
@@ -216,34 +336,20 @@ impl Render for Root {
             .size_full()
             .flex()
             .flex_col()
-            .p(px(EDGE_PADDING))
-            .gap(px(EDGE_PADDING))
-            .bg(palette.background)
-            .text_color(palette.text)
-            .font_family(FONT)
-            .child(div().flex_1().min_h_0().child(self.scrollback.clone()))
-            .child(match &self.reply {
-                Some(reply) => div()
-                    .text_color(palette.accent)
-                    .child(reply_question(&self.label, reply)),
-                None => div()
-                    .flex()
-                    .gap(px(EDGE_PADDING))
-                    .child(
-                        div()
-                            .text_color(match self.label {
-                                Label::NoTarget => palette.dim,
-                                Label::Project(_) | Label::Workspace { .. } => palette.text,
-                            })
-                            .child(prompt_label(&self.label)),
-                    )
-                    .child(div().flex_1().child(Textarea::new(&self.prompt))),
-            })
+            .bg(palette.ground)
+            .text_color(palette.ink)
+            .font_family(SANS)
             .child(
                 div()
-                    .text_color(palette.dim)
-                    .child(status_line(self.counts)),
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(MARGIN_X))
+                    .pt(px(SCROLLBACK_PAD_TOP))
+                    .pb(px(SCROLLBACK_PAD_BOTTOM))
+                    .child(self.scrollback.clone()),
             )
+            .child(self.render_prompt(&palette))
+            .child(status_bar(self.counts, &palette))
     }
 }
 
@@ -255,33 +361,48 @@ fn prompt_label(label: &Label) -> String {
     }
 }
 
-/// Reply mode's prompt line, which names the keys that answer.
-fn reply_question(label: &Label, reply: &Reply) -> String {
-    let target = match label {
+/// The name of the target that `label` shows; empty with no target.
+fn target_name(label: &Label) -> &str {
+    match label {
         Label::NoTarget => "",
         Label::Project(name) | Label::Workspace { name, .. } => name,
-    };
-    format!(
-        "? {target}  {}  [y] yes  [n] no  [esc] later",
-        reply.question
-    )
+    }
 }
 
 /// `working` shows once any agent has started, so `0 working` confirms a
-/// stop. `needs you` and `failed` show only when above 0.
-fn status_line(counts: Counts) -> String {
-    let mut parts = vec![
-        count(counts.projects, "project"),
-        count(counts.workspaces, "workspace"),
-    ];
+/// stop. `needs you` and `failed` show only when above 0. The key hints
+/// sit at the right end.
+fn status_bar(counts: Counts, palette: &Palette) -> Div {
+    let mut bar = div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(STATUS_GAP))
+        .px(px(MARGIN_X))
+        .pt(px(STATUS_PAD_TOP))
+        .pb(px(STATUS_PAD_BOTTOM))
+        .font_family(MONO)
+        .text_size(px(STATUS_SIZE))
+        .line_height(px(STATUS_LINE))
+        .text_color(palette.muted)
+        .child(count(counts.projects, "project"))
+        .child(count(counts.workspaces, "workspace"));
     if counts.any_agent_started {
-        parts.push(format!("{} working", counts.working));
+        bar = bar.child(format!("{} working", counts.working));
     }
     if counts.needs_you > 0 {
-        parts.push(format!("{} needs you", counts.needs_you));
+        bar = bar.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(STATUS_MARK_GAP))
+                .text_color(palette.ink)
+                .child(request::mark(palette))
+                .child(format!("{} needs you", counts.needs_you)),
+        );
     }
     if counts.failed > 0 {
-        parts.push(format!("{} failed", counts.failed));
+        bar = bar.child(format!("{} failed", counts.failed));
     }
     let mut keys = Vec::new();
     if counts.needs_you > 0 {
@@ -290,12 +411,11 @@ fn status_line(counts: Counts) -> String {
     if counts.agents_alive > 0 {
         keys.push("⌘. stop");
     }
-    let mut line = parts.join(STATUS_SEPARATOR);
-    if !keys.is_empty() {
-        line.push_str(STATUS_KEYS_GAP);
-        line.push_str(&keys.join(STATUS_KEYS_GAP));
+    for (index, key) in keys.into_iter().enumerate() {
+        let hint = div().child(key);
+        bar = bar.child(if index == 0 { hint.ml_auto() } else { hint });
     }
-    line
+    bar
 }
 
 fn count(n: usize, noun: &str) -> String {
