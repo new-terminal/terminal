@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PRIVATE_FILE_MODE: u32 = 0o600;
+use crate::home::PRIVATE_FILE_MODE;
 
 #[derive(Debug)]
 pub struct AppLog {

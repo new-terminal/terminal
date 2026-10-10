@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::grammar::Name;
+use crate::state::{ProjectEntry, StateFile};
 
 /// The line that lists an empty registry.
 pub const NO_PROJECTS: &str = "No projects yet. Add one: add project <name> <path>";
@@ -22,6 +23,26 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// A registry of `projects` in the given order. The caller has checked
+    /// them against the name and path rules.
+    pub const fn from_projects(projects: Vec<Project>) -> Self {
+        Self { projects }
+    }
+
+    /// The state file that holds this registry and `target`.
+    pub fn to_state(&self, target: Option<&Name>) -> StateFile {
+        StateFile::new(
+            target.map(ToString::to_string),
+            self.projects
+                .iter()
+                .map(|project| ProjectEntry {
+                    name: project.name.to_string(),
+                    path: project.path.clone(),
+                })
+                .collect(),
+        )
+    }
+
     /// A new registry with `project` added last.
     pub fn with_project(&self, project: Project) -> Self {
         let mut projects = self.projects.clone();

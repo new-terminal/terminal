@@ -15,6 +15,7 @@ mod metrics;
 mod paths;
 mod permission;
 mod registry;
+mod state;
 mod stop;
 mod stream;
 mod worker;

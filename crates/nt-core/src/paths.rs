@@ -79,9 +79,18 @@ pub fn expand_tilde(raw: &str, home_dir: &Path) -> PathBuf {
     }
 }
 
+/// `path` with a leading home directory written as `~`, as the author
+/// would type it.
+pub fn with_tilde(path: &Path, home_dir: &Path) -> String {
+    match path.strip_prefix(home_dir) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Runs the 7 rules in order and returns the canonical path, or the first
-/// rule the path breaks. Rule 5 tests `path` as given and its canonical
-/// form, so a link cannot hide a guarded part on either side.
+/// rule the path breaks.
 pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
     if !path.is_absolute() {
         return Err(rule(1, "the path must be absolute".to_owned()));
@@ -95,36 +104,7 @@ pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
                 format!("{} is not an existing directory", path.display()),
             )
         })?;
-    if canonical.parent().is_none() || rules.home_dir.starts_with(&canonical) {
-        return Err(rule(
-            3,
-            "the path must not be /, your home directory, or a directory that holds it".to_owned(),
-        ));
-    }
-    if canonical.starts_with(rules.app_home) {
-        return Err(rule(
-            4,
-            format!(
-                "the path must not be inside New Terminal's home ({})",
-                rules.app_home.display()
-            ),
-        ));
-    }
-    if let Some(part) = guarded_part(path).or_else(|| guarded_part(&canonical)) {
-        return Err(rule(
-            5,
-            format!(
-                "the path must not include a directory Claude Code guards or a credential directory ({part})"
-            ),
-        ));
-    }
-    if let Some((name, _)) = rules
-        .other_projects
-        .iter()
-        .find(|(_, other)| *other == canonical)
-    {
-        return Err(rule(6, format!("the path is already project {name}")));
-    }
+    check_placement(path, &canonical, rules)?;
     if let Some(value) = rules.claude_config_dir.filter(|value| !value.is_empty()) {
         let config_dir = PathBuf::from(value);
         let config_dir = fs::canonicalize(&config_dir).unwrap_or(config_dir);
@@ -139,6 +119,50 @@ pub fn check(path: &Path, rules: &Rules<'_>) -> Result<PathBuf, PathRule> {
         }
     }
     Ok(canonical)
+}
+
+/// Runs rules 3 to 6 on a path read from the state file. A stored path is
+/// canonical when it exists, so it stands for both forms that rule 5
+/// tests. Rule 7 waits for the captured environment and is not run here,
+/// so `rules.claude_config_dir` is not read.
+pub fn check_stored(stored: &Path, rules: &Rules<'_>) -> Result<(), PathRule> {
+    check_placement(stored, stored, rules)
+}
+
+/// Rules 3 to 6. Rule 5 tests `given` and `canonical`, so a link cannot
+/// hide a guarded part on either side.
+fn check_placement(given: &Path, canonical: &Path, rules: &Rules<'_>) -> Result<(), PathRule> {
+    if canonical.parent().is_none() || rules.home_dir.starts_with(canonical) {
+        return Err(rule(
+            3,
+            "the path must not be /, your home directory, or a directory that holds it".to_owned(),
+        ));
+    }
+    if canonical.starts_with(rules.app_home) {
+        return Err(rule(
+            4,
+            format!(
+                "the path must not be inside New Terminal's home ({})",
+                rules.app_home.display()
+            ),
+        ));
+    }
+    if let Some(part) = guarded_part(given).or_else(|| guarded_part(canonical)) {
+        return Err(rule(
+            5,
+            format!(
+                "the path must not include a directory Claude Code guards or a credential directory ({part})"
+            ),
+        ));
+    }
+    if let Some((name, _)) = rules
+        .other_projects
+        .iter()
+        .find(|(_, other)| *other == canonical)
+    {
+        return Err(rule(6, format!("the path is already project {name}")));
+    }
+    Ok(())
 }
 
 const fn rule(number: u8, text: String) -> PathRule {

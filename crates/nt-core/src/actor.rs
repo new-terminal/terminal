@@ -6,6 +6,8 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::fs::File;
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -24,12 +26,13 @@ use crate::env::{self, Environment};
 use crate::grammar::{
     self, Intent, IntentKind, LINE_LIMIT_KB, LIST_WORDS, NAME_RULE, Name, Parsed,
 };
-use crate::home::{self, Home};
+use crate::home::{self, Home, LockError};
 use crate::log::{AgentLog, AppLog, Direction};
 use crate::metrics::{KeypressSamples, KeypressSummary, whole_ms_rounded_up};
 use crate::paths::{self, Rules};
 use crate::permission::{self, Verdict};
 use crate::registry::{NO_PROJECTS, Project, Registry};
+use crate::state::{self, StateFile};
 use crate::stop::{SignalSent, Step, StopSteps};
 use crate::stream::{self, Effect, PermissionRequest};
 use crate::worker::{self, Call, ChildDone};
@@ -55,6 +58,8 @@ const NO_LONGER_WAITING: &str = "That request is no longer waiting.";
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
 const READING_ENVIRONMENT: &str =
     "Reading your shell environment. Send the line again in a moment.";
+const WILL_NOT_CHANGE: &str =
+    "New Terminal will not change this file. Fix or move it, then relaunch.";
 
 /// Everything that reaches the actor.
 #[derive(Debug)]
@@ -153,9 +158,12 @@ fn run(
         quit_flag: Arc::new(AtomicBool::new(false)),
         calls_running: 0,
         env: EnvState::Reading,
+        state_lock: None,
+        refusal: None,
         registry: Registry::default(),
         adding: Vec::new(),
         target: None,
+        saved_target: None,
         agents: BTreeMap::new(),
         next_agent: 0,
         attention: Queue::default(),
@@ -261,11 +269,21 @@ struct Actor {
     quit_flag: Arc<AtomicBool>,
     calls_running: usize,
     env: EnvState,
+    /// Held for the life of the core, so no second process writes the
+    /// state file.
+    state_lock: Option<File>,
+    /// When set, every line fails with this text and the state file is
+    /// never written: the lock is held elsewhere, or the file could not be
+    /// read whole.
+    refusal: Option<String>,
     registry: Registry,
     /// Projects whose `add project` waits on its git call. Their names and
     /// paths are taken.
     adding: Vec<(Name, PathBuf)>,
     target: Option<Name>,
+    /// The target a relaunch would restore from the file as last read or
+    /// written.
+    saved_target: Option<Name>,
     agents: BTreeMap<AgentId, Agent>,
     next_agent: u64,
     attention: Queue,
@@ -298,10 +316,80 @@ impl Actor {
                 ("home", &home),
             ],
         );
+        self.open_state();
         self.show_prompt(None);
-        self.emit(Event::Status(Counts::default()));
-        self.app_line(LineKind::App, NO_PROJECTS.to_owned());
+        self.sent_counts = self.counts();
+        self.emit(Event::Status(self.sent_counts));
         self.run_call(env::capture_call(), CallPurpose::EnvCapture);
+    }
+
+    /// Takes the state lock, then loads the state file and restores the
+    /// registry and the target. A held lock or a file that fails a load
+    /// check starts refusal mode.
+    fn open_state(&mut self) {
+        match self.home.lock() {
+            Ok(file) => self.state_lock = Some(file),
+            Err(LockError::Held) => {
+                let path = self.home.lock_file().display().to_string();
+                self.log("lock held", &[("path", &path)]);
+                let home = self.tilde(&self.home.root);
+                return self.refuse(format!(
+                    "Another New Terminal is using {home}. Quit it first."
+                ));
+            }
+            Err(LockError::Failed(error)) => {
+                let path = self.tilde(&self.home.lock_file());
+                return self.refuse(format!("Cannot lock {path}: {error}."));
+            }
+        }
+        let path = self.home.state_file();
+        let loaded = state::read(&path).and_then(|file| {
+            file.map(|file| state::check(file, &self.home_dir, &self.home.root, state::look))
+                .transpose()
+        });
+        match loaded {
+            Ok(Some(loaded)) => {
+                for warning in loaded.warnings {
+                    self.app_line(LineKind::Warning, warning);
+                }
+                self.registry = loaded.registry;
+                self.target.clone_from(&loaded.target);
+                self.saved_target = loaded.target;
+            }
+            Ok(None) => {}
+            Err(problem) => {
+                let shown = path.display().to_string();
+                self.log(
+                    "state load error",
+                    &[("path", &shown), ("problem", &problem)],
+                );
+                let path = self.tilde(&path);
+                self.refuse(format!("Cannot read {path}: {problem}."));
+                return self.app_line(LineKind::Error, WILL_NOT_CHANGE.to_owned());
+            }
+        }
+        if self.registry.project_count() == 0 {
+            self.app_line(LineKind::App, NO_PROJECTS.to_owned());
+        }
+    }
+
+    /// Shows `text` and fails every later line with it.
+    fn refuse(&mut self, text: String) {
+        self.app_line(LineKind::Error, text.clone());
+        self.refusal = Some(text);
+    }
+
+    fn tilde(&self, path: &Path) -> String {
+        paths::with_tilde(path, &self.home_dir)
+    }
+
+    /// Writes `file` over `state.json` and logs how long it took.
+    fn save_state(&mut self, file: &StateFile) -> io::Result<()> {
+        let started = Instant::now();
+        state::save(&self.home.state_file(), &self.home.state_temp(), file)?;
+        let ms = whole_ms_rounded_up(started.elapsed()).to_string();
+        self.log("state saved", &[("state_save_ms", &ms)]);
+        Ok(())
     }
 
     fn handle(&mut self, message: Message) {
@@ -332,7 +420,14 @@ impl Actor {
     }
 
     fn submit(&mut self, line: &str, at: Instant) {
-        let refusal = match grammar::parse(line) {
+        let parsed = grammar::parse(line);
+        if parsed == Parsed::Empty {
+            return;
+        }
+        if let Some(refusal) = &self.refusal {
+            return self.app_line(LineKind::Error, refusal.clone());
+        }
+        let refusal = match parsed {
             Parsed::Empty => return,
             Parsed::List => return self.list(),
             Parsed::Intent(Intent::AddProject { name, path }) => {
@@ -392,10 +487,43 @@ impl Actor {
         true
     }
 
+    /// Applies the target at once, then saves it.
     fn set_target(&mut self, name: Name) {
-        self.log("target", &[("name", name.as_ref()), ("saved", "no")]);
+        let field = name.to_string();
         self.target = Some(name);
         self.show_prompt(None);
+        let saved = self.saved_target == self.target || self.save_target();
+        self.log(
+            "target",
+            &[
+                ("name", &field),
+                ("saved", if saved { "yes" } else { "no" }),
+            ],
+        );
+    }
+
+    /// Saves the live target. A failed save keeps it, because the label
+    /// already shows it and the next line goes there, and warns what a
+    /// relaunch would restore.
+    fn save_target(&mut self) -> bool {
+        let file = self.registry.to_state(self.target.as_ref());
+        match self.save_state(&file) {
+            Ok(()) => {
+                self.saved_target.clone_from(&self.target);
+                true
+            }
+            Err(error) => {
+                let after = self.saved_target.as_ref().map_or_else(
+                    || "there is no target".to_owned(),
+                    |name| format!("the target is {name}"),
+                );
+                self.app_line(
+                    LineKind::Warning,
+                    format!("Could not save the target: {error}. After a relaunch {after}."),
+                );
+                false
+            }
+        }
     }
 
     /// Sends the prompt label for the target, in reply mode for `reply`.
@@ -569,7 +697,17 @@ impl Actor {
             "not a git repository".to_owned()
         };
         let text = format!("Added project {name}: {} ({kind})", path.display());
-        self.registry = self.registry.with_project(Project { name, path });
+        let registry = self.registry.with_project(Project { name, path });
+        let file = registry.to_state(self.target.as_ref());
+        if let Err(error) = self.save_state(&file) {
+            let path = self.tilde(&self.home.state_file());
+            return self.app_line(
+                LineKind::Error,
+                format!("Could not save {path}: {error}. Nothing changed."),
+            );
+        }
+        self.registry = registry;
+        self.saved_target.clone_from(&self.target);
         self.app_line(LineKind::App, text);
     }
 
