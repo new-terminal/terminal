@@ -94,6 +94,13 @@ impl Registry {
         next
     }
 
+    /// A new registry without the workspace `name`.
+    pub fn without_workspace(&self, name: &Name) -> Self {
+        let mut next = self.clone();
+        next.workspaces.retain(|workspace| &workspace.name != name);
+        next
+    }
+
     /// Names are lowercase by the name rule, so an exact match is a match
     /// without case.
     pub fn find(&self, name: &Name) -> Option<Entry<'_>> {
@@ -125,6 +132,14 @@ impl Registry {
             Entry::Project(project) => format!("project {}", project.name),
             Entry::Workspace(workspace) => format!("workspace {}", workspace.name),
         })
+    }
+
+    /// Workspace names in the order of creation.
+    pub fn workspace_names(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .map(|workspace| workspace.name.to_string())
+            .collect()
     }
 
     pub fn projects(&self) -> impl Iterator<Item = (&Name, &Path)> {

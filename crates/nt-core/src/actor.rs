@@ -37,7 +37,7 @@ use crate::state::{self, StateFile};
 use crate::stop::{SignalSent, Step, StopSteps};
 use crate::stream::{self, Effect, PermissionRequest};
 use crate::worker::{self, Call, ChildDone};
-use crate::workspace::{self, Create, Next};
+use crate::workspace::{self, Archive, ArchiveNext, ArchiveRequest, Create, Next};
 use crate::{Action, Counts, Decision, Event, Label, LineKind, Metric, Reply, Source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,6 +86,8 @@ pub enum CallPurpose {
     },
     /// A git call of the `new workspace` that holds this name.
     Create(Name),
+    /// A git call of the `archive workspace` that holds this name.
+    Archive(Name),
 }
 
 /// Runs the actor on its own thread. The thread drops `closed` when it ends,
@@ -174,6 +176,7 @@ fn run(
         registry: Registry::default(),
         adding: Vec::new(),
         creating: BTreeMap::new(),
+        archiving: BTreeMap::new(),
         target: None,
         saved_target: None,
         agents: BTreeMap::new(),
@@ -296,6 +299,9 @@ struct Actor {
     adding: Vec<(Name, PathBuf)>,
     /// Each `new workspace` in progress. Its name is taken until it ends.
     creating: BTreeMap<Name, Create>,
+    /// Each `archive workspace` in progress. Requests to its name fail
+    /// until it ends.
+    archiving: BTreeMap<Name, Archive>,
     target: Option<Name>,
     /// The target a relaunch would restore from the file as last read or
     /// written.
@@ -466,6 +472,9 @@ impl Actor {
             Parsed::Intent(Intent::NewWorkspace { name, project }) => {
                 return self.new_workspace(&name, &project);
             }
+            Parsed::Intent(Intent::ArchiveWorkspace { name }) => {
+                return self.archive_workspace(&name);
+            }
             Parsed::MentionOnly(name) => {
                 if self.mention(name.clone())
                     && let Some(item) = self.attention.for_target(&name)
@@ -483,7 +492,6 @@ impl Actor {
             Parsed::TooLong { kb } => {
                 format!("This line is {kb} KB. The limit is {LINE_LIMIT_KB} KB.")
             }
-            Parsed::Intent(intent) => not_built(intent.kind().words()),
             Parsed::IntentUsage(kind) => usage(kind).to_owned(),
             Parsed::BadMention(token) => format!("Not a valid name: @{token}."),
             Parsed::SeveralMentions => {
@@ -857,6 +865,185 @@ impl Actor {
         }
     }
 
+    fn archive_workspace(&mut self, typed_name: &str) {
+        self.log(
+            "intent",
+            &[("kind", "archive-workspace"), ("name", typed_name)],
+        );
+        let EnvState::Ready { env, .. } = &self.env else {
+            return self.app_line(LineKind::Error, READING_ENVIRONMENT.to_owned());
+        };
+        let env = Arc::clone(env);
+        let Some(name) = Name::parse(typed_name) else {
+            return self.app_line(
+                LineKind::Error,
+                format!("Cannot archive workspace {typed_name}: {NAME_RULE}."),
+            );
+        };
+        if self.creating.contains_key(&name) {
+            return self.app_line(LineKind::Error, being_created(&name));
+        }
+        if self.archiving.contains_key(&name) {
+            return self.app_line(LineKind::Error, being_archived(&name));
+        }
+        let workspace = match self.registry.find(&name) {
+            Some(Entry::Workspace(workspace)) => workspace.clone(),
+            Some(Entry::Project(_)) => {
+                return self.app_line(
+                    LineKind::Error,
+                    format!("{name} is a project. Only a workspace can be archived."),
+                );
+            }
+            None => {
+                let workspaces = self.registry.workspace_names();
+                let workspaces = if workspaces.is_empty() {
+                    "none yet".to_owned()
+                } else {
+                    workspaces.join(", ")
+                };
+                return self.app_line(
+                    LineKind::Error,
+                    format!("Unknown workspace {name}. Workspaces: {workspaces}."),
+                );
+            }
+        };
+        if self.agent_busy(&name) {
+            return self.app_line(
+                LineKind::Error,
+                format!("{name}'s agent is busy. Wait for it, or press ⌘., then archive."),
+            );
+        }
+        let Some(project_path) = self
+            .registry
+            .project(&workspace.project)
+            .map(|project| project.path.clone())
+        else {
+            return self.app_line(
+                LineKind::Error,
+                format!(
+                    "Workspace {name} names project {}, which is not listed.",
+                    workspace.project
+                ),
+            );
+        };
+        let (archive, next) = Archive::start(ArchiveRequest {
+            workspace,
+            project_path,
+            workspaces_dir: self.home.workspaces(),
+            home_dir: self.home_dir.clone(),
+            env,
+        });
+        self.drive_archive(archive, next);
+    }
+
+    /// An agent that is in a turn, waits on a permission, or is stopping.
+    fn agent_busy(&self, target: &Name) -> bool {
+        self.attention.permission_for(target).is_some()
+            || self
+                .agents
+                .values()
+                .any(|agent| agent.target == *target && (agent.in_turn || agent.is_stopping()))
+    }
+
+    /// Runs an archive's next steps until it waits on a git call or an
+    /// agent's exit, or ends. While it waits, it holds its name in
+    /// `archiving`.
+    fn drive_archive(&mut self, mut archive: Archive, mut next: ArchiveNext) {
+        loop {
+            next = match next {
+                ArchiveNext::Run(call) => {
+                    let name = archive.name().clone();
+                    self.run_call(call, CallPurpose::Archive(name.clone()));
+                    self.archiving.insert(name, archive);
+                    return;
+                }
+                ArchiveNext::EndAgent => {
+                    if self.stop_agent_of(archive.name()) {
+                        self.archiving.insert(archive.name().clone(), archive);
+                        return;
+                    }
+                    archive.agent_gone()
+                }
+                ArchiveNext::Save => match self.save_archive(archive.name()) {
+                    Ok(target_cleared) => archive.saved(target_cleared),
+                    Err(error) => archive.save_failed(&error),
+                },
+                ArchiveNext::Done { archived, lines } => {
+                    let kind = if archived {
+                        LineKind::App
+                    } else {
+                        LineKind::Error
+                    };
+                    for line in lines {
+                        self.app_line(kind, line);
+                    }
+                    return;
+                }
+            };
+        }
+    }
+
+    /// Runs the stop steps for `target`'s agent, if it has one. Returns
+    /// whether an agent record remains, which [`Self::finish`] drops.
+    fn stop_agent_of(&mut self, target: &Name) -> bool {
+        let Some(id) = self
+            .agents
+            .values()
+            .find(|agent| agent.target == *target)
+            .map(|agent| agent.id)
+        else {
+            return false;
+        };
+        if let Some(mut agent) = self.agents.remove(&id) {
+            self.begin_stop(&mut agent, Instant::now());
+            self.agents.insert(id, agent);
+        }
+        true
+    }
+
+    /// Continues the archive of `target` that waits for its agent to end.
+    fn resume_archive(&mut self, target: &Name) {
+        if self.quitting.is_some()
+            || !self
+                .archiving
+                .get(target)
+                .is_some_and(Archive::awaits_agent)
+        {
+            return;
+        }
+        if let Some(mut archive) = self.archiving.remove(target) {
+            let next = archive.agent_gone();
+            self.drive_archive(archive, next);
+        }
+    }
+
+    /// Saves the registry without the workspace `name`, and with no target
+    /// when the target names it. Swaps both in only once the save
+    /// succeeds. Returns whether the target was cleared, or the line to
+    /// show.
+    fn save_archive(&mut self, name: &Name) -> Result<bool, String> {
+        let registry = self.registry.without_workspace(name);
+        let target_cleared = self.target.as_ref() == Some(name);
+        let target = if target_cleared {
+            None
+        } else {
+            self.target.clone()
+        };
+        if let Err(error) = self.save_state(&registry.to_state(target.as_ref())) {
+            let path = self.tilde(&self.home.state_file());
+            return Err(format!("Could not save {path}: {error}."));
+        }
+        self.registry = registry;
+        self.target = target;
+        self.saved_target.clone_from(&self.target);
+        self.failed_targets.remove(name);
+        self.attention.remove_turn_of(name);
+        if target_cleared && self.replying.is_none() {
+            self.show_prompt(None);
+        }
+        Ok(target_cleared)
+    }
+
     fn request(&mut self, text: &str, at: Instant) {
         let Some(target) = self.target.clone() else {
             let example = self
@@ -872,6 +1059,9 @@ impl Actor {
                 ),
             );
         };
+        if self.archiving.contains_key(&target) {
+            return self.app_line(LineKind::Error, being_archived(&target));
+        }
         if let Some(item) = self.attention.permission_for(&target) {
             self.app_line(
                 LineKind::Error,
@@ -1510,7 +1700,9 @@ impl Actor {
         {
             self.log_duration("stop_ms", exited.saturating_duration_since(started));
         }
+        let target = agent.target.clone();
         drop(agent);
+        self.resume_archive(&target);
     }
 
     /// Once quit has ended every agent, tells the child calls to stop, waits
@@ -1596,6 +1788,12 @@ impl Actor {
                 if let Some(mut create) = self.creating.remove(&name) {
                     let next = create.on_done(done);
                     self.drive_create(create, next);
+                }
+            }
+            CallPurpose::Archive(name) => {
+                if let Some(mut archive) = self.archiving.remove(&name) {
+                    let next = archive.on_done(done);
+                    self.drive_archive(archive, next);
                 }
             }
         }
@@ -1759,8 +1957,8 @@ fn taken_by_create(name: &Name) -> String {
     format!("{name} is taken by workspace {name}, which is being created.")
 }
 
-fn not_built(intent_words: &str) -> String {
-    format!("{intent_words} is not built yet. Nothing changed.")
+fn being_archived(name: &Name) -> String {
+    format!("{name} is being archived.")
 }
 
 const fn usage(kind: IntentKind) -> &'static str {

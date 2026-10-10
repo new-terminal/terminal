@@ -13,6 +13,8 @@ use crate::worker::{self, Call, ChildDone};
 
 /// `show-ref --verify --quiet` exits with this code when the ref is absent.
 const REF_ABSENT_CODE: i32 = 1;
+/// Where the path starts in a `status --porcelain` line, after `XY `.
+const STATUS_PATH_START: usize = 3;
 /// `rev-parse --verify --quiet` exits with this code, and prints nothing,
 /// when its argument names no commit, as `HEAD` does in a repository with
 /// no commits yet. Outside a repository git exits with 128.
@@ -74,6 +76,25 @@ impl Repo {
                 copy.as_os_str(),
             ],
         )
+    }
+
+    /// Removes a clean copy. Git refuses one with changed or untracked
+    /// files, and removes its ignored files with it.
+    pub fn worktree_remove(&self, copy: &Path) -> Call {
+        self.call(
+            "git-worktree-remove",
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                copy.as_os_str(),
+            ],
+        )
+    }
+
+    /// Lists changed and untracked files. Run it on the copy, not the
+    /// project.
+    pub fn status_porcelain(&self) -> Call {
+        self.call("git-status", &["status", "--porcelain"])
     }
 
     pub fn worktree_list(&self) -> Call {
@@ -147,13 +168,20 @@ impl Failure {
 /// The call's stdout, trimmed, when it exited with 0 and its stdout is
 /// whole.
 pub fn stdout(done: &ChildDone, words: &str) -> Result<String, Failure> {
+    let bytes = whole_stdout(done, words)?;
+    Ok(String::from_utf8_lossy(bytes).trim().to_owned())
+}
+
+/// The call's stdout as git wrote it, when it exited with 0 and its stdout
+/// is whole.
+pub fn whole_stdout<'a>(done: &'a ChildDone, words: &str) -> Result<&'a [u8], Failure> {
     succeeded(done, words)?;
     if done.stdout_cut {
         return Err(Failure::Broken(format!(
             "{words} printed more than the 1 MiB that New Terminal reads"
         )));
     }
-    Ok(String::from_utf8_lossy(&done.stdout).trim().to_owned())
+    Ok(&done.stdout)
 }
 
 /// `Ok` when the call exited with 0. Its output is not read.
@@ -227,6 +255,30 @@ pub fn parse_worktree_list(bytes: &[u8]) -> Vec<WorktreeEntry> {
     }
     entries.extend(current);
     entries
+}
+
+/// What `git status --porcelain` printed: one line per changed or
+/// untracked path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changes {
+    pub count: usize,
+    /// The first paths, as git shows them, at most the number asked for.
+    pub shown: Vec<String>,
+}
+
+/// Parses `git status --porcelain`, keeping the first `keep` paths. Each
+/// line is a two-letter status, a space, then the path.
+pub fn parse_status(bytes: &[u8], keep: usize) -> Changes {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    Changes {
+        count: lines.len(),
+        shown: lines
+            .iter()
+            .take(keep)
+            .map(|line| line.get(STATUS_PATH_START..).unwrap_or(line).to_owned())
+            .collect(),
+    }
 }
 
 /// The first 7 characters of a commit id, as git shows it.

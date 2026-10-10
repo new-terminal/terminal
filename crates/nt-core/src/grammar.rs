@@ -70,26 +70,11 @@ impl IntentKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
     /// `path` is the rest of the line, so it may hold spaces.
-    AddProject {
-        name: String,
-        path: String,
-    },
+    AddProject { name: String, path: String },
     /// `project` is lowercase, as a mention, with its `@` removed.
-    NewWorkspace {
-        name: String,
-        project: String,
-    },
-    ArchiveWorkspace,
-}
-
-impl Intent {
-    pub const fn kind(&self) -> IntentKind {
-        match self {
-            Self::AddProject { .. } => IntentKind::AddProject,
-            Self::NewWorkspace { .. } => IntentKind::NewWorkspace,
-            Self::ArchiveWorkspace => IntentKind::ArchiveWorkspace,
-        }
-    }
+    NewWorkspace { name: String, project: String },
+    /// `name` is lowercase, as a mention, with its `@` removed.
+    ArchiveWorkspace { name: String },
 }
 
 /// What one line asks for.
@@ -139,16 +124,12 @@ fn parse_intent(line: &str) -> Option<Parsed> {
     let (second, arguments) = split_word(rest)?;
     let typed = format!("{first} {second}");
     let starts_with = |kind: IntentKind| typed.eq_ignore_ascii_case(kind.words());
-    let word_count = arguments.split_whitespace().count();
     let (kind, intent) = if starts_with(IntentKind::AddProject) {
         (IntentKind::AddProject, add_project(arguments))
     } else if starts_with(IntentKind::NewWorkspace) {
         (IntentKind::NewWorkspace, new_workspace(arguments))
     } else if starts_with(IntentKind::ArchiveWorkspace) {
-        (
-            IntentKind::ArchiveWorkspace,
-            (word_count == 1).then_some(Intent::ArchiveWorkspace),
-        )
+        (IntentKind::ArchiveWorkspace, archive_workspace(arguments))
     } else {
         return None;
     };
@@ -165,6 +146,18 @@ fn new_workspace(arguments: &str) -> Option<Intent> {
     Some(Intent::NewWorkspace {
         name: name.to_owned(),
         project: project.to_lowercase(),
+    })
+}
+
+/// `<name>`, where the `@` is optional.
+fn archive_workspace(arguments: &str) -> Option<Intent> {
+    let mut words = arguments.split_whitespace();
+    let (Some(name), None) = (words.next(), words.next()) else {
+        return None;
+    };
+    let name = name.strip_prefix('@').unwrap_or(name);
+    Some(Intent::ArchiveWorkspace {
+        name: name.to_lowercase(),
     })
 }
 
