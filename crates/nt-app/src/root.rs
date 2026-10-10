@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use gpui_kit::base::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState};
 use gpui_kit::{
     App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, IntoElement,
     Keystroke, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
@@ -54,7 +54,7 @@ pub struct Root {
     launched: Instant,
     cold_start_sent: bool,
     /// Set while the window shows the demo scene, which core events must
-    /// not change.
+    /// not change, and whose prompt and `Tab` send nothing to the core.
     #[cfg(debug_assertions)]
     demo: bool,
     _subscriptions: Vec<Subscription>,
@@ -69,10 +69,18 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        // The input's own caret takes the accent, like the caret block before
+        // it. Every other color stays unset, so it follows the theme.
+        let accent = cx.global::<Palette>().accent;
         let prompt = cx.new(|cx| {
-            TextareaState::new(window, cx)
+            let mut prompt = TextareaState::new(window, cx)
                 .submit_on_enter(true)
-                .auto_grow(PROMPT_MIN_ROWS, PROMPT_MAX_ROWS)
+                .auto_grow(PROMPT_MIN_ROWS, PROMPT_MAX_ROWS);
+            prompt.set_editor_style(InputEditorStyle {
+                caret: accent,
+                ..InputEditorStyle::default()
+            });
+            prompt
         });
         let on_enter = cx.subscribe_in(
             &prompt,
@@ -155,6 +163,10 @@ impl Root {
     }
 
     fn submit(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        #[cfg(debug_assertions)]
+        if self.demo {
+            return;
+        }
         let text = self.prompt.read(cx).value().to_string();
         if text.trim().is_empty() {
             return;
@@ -184,6 +196,10 @@ impl Root {
         cx: &mut Context<'_, Self>,
     ) -> bool {
         if keystroke.modifiers.platform {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        if self.demo {
             return false;
         }
         let plain = !keystroke.modifiers.modified();

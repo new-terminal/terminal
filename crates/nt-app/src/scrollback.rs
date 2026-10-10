@@ -223,9 +223,10 @@ impl Scrollback {
         self.pending = None;
     }
 
-    /// Shows the permission that reply mode answers as the request block,
-    /// and lets its buttons answer. When the newest push is `target`'s
-    /// block text, the block takes its place and shows that text.
+    /// Shows the permission that reply mode answers as the request block at
+    /// the end of the scrollback, scrolled into view, and lets its buttons
+    /// answer. When the newest push is `target`'s block text, the block
+    /// takes its place and shows that text.
     pub fn raise_request(&mut self, target: &str, question: &str) {
         let text = match self.pending.take() {
             Some(pending) if pending.target == target && pending.rows <= self.rows.len() => {
@@ -257,6 +258,7 @@ impl Scrollback {
             .map(|part| Body::Request { request, part })
             .collect();
         self.push(Speaker::Source(target.to_owned()), bodies);
+        self.list.scroll_to_end();
         self.answering = Some(request);
     }
 

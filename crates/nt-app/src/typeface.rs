@@ -8,7 +8,8 @@ use gpui_kit::base::Theme;
 /// Prose, echo lines, and the request block's words.
 pub const SANS: &str = "Avenir Next";
 /// Commands, paths, tool lines, labels, the prompt, and the status bar.
-/// Menlo has no medium face, so a medium weight draws as regular.
+/// The mockup sets some of these spans at medium weight. Menlo has no
+/// medium face, so the app asks for none.
 pub const MONO: &str = "Menlo";
 
 /// Makes inline code inside the scrollback's text views use [`MONO`].

@@ -175,8 +175,8 @@ pub enum Event {
         text: String,
     },
     /// The prompt label to show before the input. With `reply` set, the
-    /// prompt is in reply mode: it shows the question in place of the input
-    /// and takes only an answer for that item.
+    /// prompt is in reply mode: the window shows the request and takes only
+    /// an answer for that item.
     Prompt {
         label: Label,
         reply: Option<Reply>,

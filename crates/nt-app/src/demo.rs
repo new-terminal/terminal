@@ -1,7 +1,9 @@
 //! A fixed scene for reviewing the window's look without typing, shown when
 //! a debug build starts with `NT_DEMO=1`, or with `NT_DEMO=dark` to see it
 //! in the dark palette whatever the system appearance. It only fills the
-//! view: it sends nothing to the core and reads or writes no file.
+//! view: core events do not change it, and the prompt and `Tab` send
+//! nothing to the core while it shows. The app still starts its core and
+//! writes its log, as every debug build does.
 
 use nt_core::{Counts, Label, LineKind, Source};
 

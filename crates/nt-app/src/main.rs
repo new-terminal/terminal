@@ -88,15 +88,14 @@ fn main() {
 
 /// Whether a debug launch asked to review the dark palette whatever the
 /// system appearance, so the window neither reads nor follows it.
+#[cfg(debug_assertions)]
 fn pinned_dark() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        demo::dark()
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
+    demo::dark()
+}
+
+#[cfg(not(debug_assertions))]
+const fn pinned_dark() -> bool {
+    false
 }
 
 /// The one quit routine. Every quit path, from the app or from the system,
